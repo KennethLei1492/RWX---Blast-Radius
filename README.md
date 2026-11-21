@@ -115,6 +115,21 @@ table mutations made for this (`tools/mutate_tables.py`: one element of a set, o
 value of a dict, replaced by another of the same table), labeled by running every reader:
 no known-failing test left out.
 
+**Fixtures loaded in a class set-up (`blast/fixtures.py`, `maps/setupreads.json`).** The
+executor tests load the TPC-H and TPC-DS query files in `setUpClass`
+(`cls.tpcds_sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))`), so all 60 of
+them open both files, and an edit to either selected all 60 at 25.5 s. A test of that class
+can only be affected by the file through the attribute it is loaded into, or by the set-up
+failing. So for a patch to such a fixture, the class's tests that never read the attribute are
+dropped, provided the patched file still loads with the pinned loader (run on the patched
+text). Which tests read the attribute comes from `tools/setup_trace.py`, which runs each test of
+the class with the attribute replaced by a recording list (only `test_execute_tpcds` reads the
+TPC-DS queries; `test_execute_tpch` and `test_optimized_tpch` the TPC-H ones); without that map,
+line coverage of the lines that read it is used. The set-ups are found in the pinned test
+source: an assignment from a call of a `tests.helpers` loader with a literal path, the file
+named nowhere else in the module. For a TPC-DS edit, `test_execute_tpcds` then goes through
+the planning check below, which reads the query file from the patched tree as the test does.
+
 **Planning-only check for the dearest test (`blast/planfp.py`, `Verifier.plan_same`).**
 `test_execute_tpcds` is recorded at 21 s, so a commit that selects it without breaking it
 costs about 19 s. The test has two parts: for each TPC-DS query sqlglot parses, optimizes and
@@ -128,7 +143,8 @@ expected result comes from), identical in three runs with different hash seeds; 
 query's share of the second part's time.
 For a commit that selects the test and only edits statements inside functions, or flips
 parameter defaults, where none of the edited functions runs while the tables load or during
-that second part, the selector runs the first part only on the patched tree, without loading
+that second part, or edits the TPC-DS query file itself (of each entry the test uses the
+metadata and the query, never the expected output), the selector runs the first part only on the patched tree, without loading
 the tables (their rows are never read while planning, and no edited code fills them). If
 every fingerprint equals the pinned one, the second part runs the same code on the same
 input, so the test cannot change its outcome and is dropped. If a few queries differ (at

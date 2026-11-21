@@ -608,6 +608,10 @@ class Selector:
             path = fp.old_path
             if path is None or fp.new_path != path or fp.binary or fp.is_new or fp.is_deleted:
                 return None
+            from .planfp import PROBE_DATA
+
+            if path in PROBE_DATA:
+                continue   # a data file the probe itself reads from the patched tree
             if not (path.startswith("sqlglot/") and path.endswith(".py")):
                 return None
             old_src = self.read(path)
@@ -684,6 +688,18 @@ class Selector:
         if fp.binary:
             return b, "binary"
         if not path.endswith(".py"):
+            if (path.startswith("tests/fixtures/") and old_path == new_path and not fp.is_new
+                    and not fp.is_deleted and b):
+                # a fixture a test class loads in its set-up: its tests that never read the
+                # attribute holding it only need the set-up to succeed (blast/fixtures.py)
+                old_text = self.read(path)
+                applied = diffparse.apply(old_text, fp) if old_text is not None else None
+                if applied is not None and applied.ok:
+                    from . import fixtures
+
+                    drop = fixtures.setup_only_readers(self, path, "\n".join(applied.new_lines), b)
+                    if drop:
+                        return b & ~drop, "data-setup"
             return b, "data"
         old_src = self.read(old_path) if old_path else None
         if old_path and old_src is None:

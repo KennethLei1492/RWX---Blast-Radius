@@ -31,6 +31,11 @@ import sys
 from .imstate import Walker
 
 TEST_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+# The data file the probe reads as the test does (through tests.helpers.load_sql_fixture_pairs):
+# an edit to it is compared like a code edit. Of each entry (meta, sql, expected) the test
+# uses meta and sql only (`for args, sql, _ in sqls` in _mp_execute, `_, sql, _ = ...` in
+# subtestHelper), so those are what the probe fingerprints.
+PROBE_DATA = frozenset({"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"})
 
 
 _PRIM = (type(None), bool, int, float, complex, str, bytes)
@@ -247,7 +252,9 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
         got.append(PlanWalker(line_maps, seed, stable).fp((plan, outer_scope, self.__dict__)).hex())
         return None
 
-    setup = PlanWalker(line_maps, seed).fp((tables, schema, sqls)).hex()
+    # Each query's text is compared per query below (it is parsed for every query, and planned
+    # and handed to DuckDB for those that execute): the set-up holds what applies to all.
+    setup = PlanWalker(line_maps, seed).fp((tables, schema, [meta for meta, _, _ in sqls])).hex()
     if baseline is not None and setup != baseline["setup"]:
         return {"same": False, "at": "setup"}
 
