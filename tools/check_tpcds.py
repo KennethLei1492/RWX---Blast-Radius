@@ -63,7 +63,12 @@ def main():
                 r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 same = None
                 if not at_import or v.import_diff(patch, imstate, 60) == []:
-                    same = v.plan_same(patch, base, 120)
+                    # the selector's limits (selector.plan_check_commits), with a long timeout
+                    # so that a loaded machine does not hide a wrong answer behind "unknown"
+                    saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
+                    run_limit = max(0.0, 0.4 * saving_s - 2.0)
+                    same = v.plan_same(patch, base, 300, run_limit=run_limit, qshare=blob.get("qshare"),
+                                       test_seconds=sel.ms[bit] / 1000)
                 else:
                     v.plan_at = "import"
                     same = False
@@ -72,7 +77,8 @@ def main():
                 cpu += c
                 what = "dropped" if same else ("kept, unknown" if same is None else "kept, differs")
                 what_at = getattr(v, "plan_at", None)
-                print(f"   {cid}: probe {c:.1f}s cpu, first difference {what_at}", flush=True)
+                print(f"   {cid}: probe {c:.1f}s cpu, first difference {what_at}, ran {getattr(v, 'plan_ran', None)}",
+                      flush=True)
             stats[what] += 1
             if what == "dropped" and fails:
                 miss += 1

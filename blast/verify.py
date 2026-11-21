@@ -124,10 +124,13 @@ class Verifier:
         self.entry = {k: v for k, v in got.get("entry", {}).items() if v is not None}
         return got["diff"]
 
-    def plan_same(self, patch_text: str, baseline: dict, timeout: float = 60):
-        """True when, on the patched tree, everything test_execute_tpcds hands to the Python
-        executor equals the pinned fingerprints (blast/planfp.py); False when something
-        differs; None if that cannot be established."""
+    def plan_same(self, patch_text: str, baseline: dict, timeout: float = 60, run_limit: float = 0.0,
+                  qshare=None, test_seconds: float = 0.0, collect: int = 6):
+        """True when test_execute_tpcds cannot change its outcome on the patched tree: everything
+        it hands to the Python executor equals the pinned fingerprints, or the few queries whose
+        plans differ (running them estimated at most `run_limit` seconds) pass when run
+        (blast/planfp.py); False when it may fail; None if that cannot be established."""
+        self.plan_at = self.plan_ran = None
         if not self.start():
             return None
         files = self.overlay(patch_text)
@@ -137,10 +140,18 @@ class Verifier:
 
         maps = {os.path.join(self.root, rel): _line_map(ap) for rel, ap in self.applied.items()
                 if rel.endswith(".py")}
-        got = self._fork(lambda: planfp.probe(self.root, files, maps, baseline), timeout)
+        edited = {}
+        for rel, ap in self.applied.items():
+            if rel.endswith(".py"):
+                edited[os.path.join(self.root, rel)] = set(ap.new_changed) | {n for _, n, _ in ap.inserted}
+        got = self._fork(lambda: planfp.probe(self.root, files, maps, baseline,
+                                              collect=collect if run_limit > 0 else 0,
+                                              run_limit=run_limit, qshare=qshare,
+                                              test_seconds=test_seconds, edited=edited), timeout)
         if not isinstance(got, dict) or "same" not in got:
             return None
         self.plan_at = got.get("at")
+        self.plan_ran = got.get("ran")
         return bool(got["same"])
 
     def _fork(self, job, timeout: float):

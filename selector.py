@@ -121,11 +121,18 @@ def plan_check_commits(sel, tests, ms, patches, static):
                 print(f"{cid}: planning check not possible, the import "
                       f"{'is unknown' if diff is None else 'differs'}; kept", file=sys.stderr)
                 continue
-        same = v.plan_same(patches[cid], blob["base"], timeout=30)
+        # The probe may spend at most about what dropping the test saves: a wall-clock limit of
+        # 0.9 x the saving for planning, plus up to 0.4 x the saving (less the cost of loading
+        # the tables) for running the few queries whose plans changed.
+        saving_s = saving / 1000
+        run_limit = max(0.0, 0.4 * saving_s - 2.0)
+        same = v.plan_same(patches[cid], blob["base"], timeout=min(60.0, 0.9 * saving_s + 2 * run_limit),
+                           run_limit=run_limit, qshare=blob.get("qshare"), test_seconds=ms[num] / 1000)
         c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu = c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime
         if same:
-            print(f"{cid}: planning check {cpu:.3f}s cpu: plans unchanged, dropping test_execute_tpcds "
+            how = f"queries {v.plan_ran} pass when run" if v.plan_ran else "plans unchanged"
+            print(f"{cid}: planning check {cpu:.3f}s cpu: {how}, dropping test_execute_tpcds "
                   f"(saves {saving / 1000:.1f}s)", file=sys.stderr)
             results[cid] = static[cid] - {num}
         else:

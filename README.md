@@ -106,21 +106,32 @@ no known-failing test left out.
 costs about 19 s. The test has two parts: for each TPC-DS query sqlglot parses, optimizes and
 plans it (cheap), then the Python executor runs the plan over the fixture tables and the
 result is compared with DuckDB's (nearly all of the time). `maps/tpcds.bin` holds the lines
-of the pinned tree that run in the second part (from the entry of `PythonExecutor.execute`
-until the result has been compared), recorded in three runs with different hash seeds, and a
-structural fingerprint of everything the second part is handed: the fixture tables, the
-executor object, each query's plan, and the DuckDB SQL the expected result comes from.
+of the pinned tree that run while the test class loads the fixture tables and in the second
+part (from the entry of `PythonExecutor.execute` until the result has been compared),
+recorded in two runs with different hash seeds; a structural fingerprint of everything the
+second part is handed (the executor object, each query's plan, and the DuckDB SQL the
+expected result comes from), identical in three runs with different hash seeds; and each
+query's share of the second part's time.
 For a commit that selects the test and only edits statements inside functions, or flips
-parameter defaults, where none of the edited functions runs during that second part, the
-selector runs the first part only on the patched tree (1 to 6 s of CPU, stopping at the first
-difference). If every fingerprint equals the pinned one, the second part runs the same code
-on the same input, so the test cannot change its outcome and is dropped. If an edited
-function also runs while modules are imported, the import diff above must first show that
-the import leaves exactly the pinned state. Other files in the same patch (a fixture, a
-docstring, another test file) are left out of this when their own selection does not hold
-the test; the probe still runs on the whole patch. Checked with `tools/check_tpcds.py` on 115
-labeled commits that select the test: it was dropped in 36, none of which fails it, and kept
-in all 48 where it fails.
+parameter defaults, where none of the edited functions runs while the tables load or during
+that second part, the selector runs the first part only on the patched tree, without loading
+the tables (their rows are never read while planning, and no edited code fills them). If
+every fingerprint equals the pinned one, the second part runs the same code on the same
+input, so the test cannot change its outcome and is dropped. If a few queries differ (at
+most six, and running them estimated at no more than 0.4 x the saving less 2 s), the probe
+loads the tables and runs just those queries the way the test does, each result compared
+with DuckDB's; the test is dropped when they all pass. That is sound because every other
+query has the pinned plan and runs pinned code on pinned input, and the executor keeps no
+state from one query to the next except a dispatch cache keyed by generator class; should an
+edited function start while the differing queries execute, the test is kept. A mismatch
+early in planning ends the probe in about 0.3 s; the whole probe is limited to about the
+time dropping the test would save. If an edited function also runs while modules are
+imported, the import diff above must first show that the import leaves exactly the pinned
+state. Other files in the same patch (a fixture, a docstring, another test file) are left out
+of this when their own selection does not hold the test; the probe still runs on the whole
+patch. Checked with `tools/check_tpcds.py` on 115 labeled commits that select the test: it
+was dropped in 41, none of which fails it (5 of them by running 1 to 6 differing queries),
+and kept in all 48 where it fails.
 
 **Running cheap selections (`blast/verify.py`, `blast/policy.py`).** The rules allow running
 sqlglot's tests while deciding (the CPU is charged). For a commit whose selection is cheap

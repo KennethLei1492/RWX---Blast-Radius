@@ -2,7 +2,8 @@
 
   python -I -B tools/build_tpcds.py fp OUT.json        one baseline fingerprint run
   python -I -B tools/build_tpcds.py trace OUT.json     lines that run in the execution part
-  python -I -B tools/build_tpcds.py merge OUT.bin TRACE.json[,TRACE.json...] FP.json [FP.json ...]
+  python -I -B tools/build_tpcds.py qcost OUT.json     each query's share of the execution part
+  QCOST=Q.json[,Q.json] python -I -B tools/build_tpcds.py merge OUT.bin TRACE.json[,...] FP.json [FP.json ...]
 
 `fp` is run several times under different PYTHONHASHSEED values; `merge` refuses to write
 anything unless all runs agree, so a fingerprint that depends on the process is never stored.
@@ -33,8 +34,9 @@ def run_fp(out):
 
 def run_trace(out):
     """Run the real test in this process (pools inline, as when verifying) and record every
-    line of the tree that runs from the entry of PythonExecutor.execute until the next query
-    is parsed, and inside subtestHelper except while transpiling the query for DuckDB."""
+    line of the tree that runs in the class set-up, from the entry of PythonExecutor.execute
+    until the next query is parsed, and inside subtestHelper except while transpiling the
+    query for DuckDB."""
     from blast import verify
 
     verify._install_overlay(ROOT, {})
@@ -89,7 +91,11 @@ def run_trace(out):
         return real_helper(self, *a, **k)
 
     cls = te.TestExecutor
-    cls.setUpClass()
+    on()   # the class set-up loads the fixture tables: the probe skips it, so its lines count
+    try:
+        cls.setUpClass()
+    finally:
+        off()
     py.PythonExecutor.execute = execute
     te.parse_one = parse_one
     te.transpile = transpile
@@ -106,6 +112,36 @@ def run_trace(out):
     print("execute calls", calls[0], "files", len(files), "lines", len(seen))
 
 
+def run_qcost(out):
+    """Each query's share of the execution part: CPU of running its plan and comparing the
+    result with DuckDB's, as fractions of the sum (the selector scales them by the test's
+    recorded seconds to budget running only the queries whose plans changed)."""
+    import pickle
+    import time
+
+    from blast import verify
+
+    verify._install_overlay(ROOT, {})
+    import tests.test_executor as te
+
+    cls = te.TestExecutor
+    cls.setUpClass()
+    te.initializer(te.TPCDS_SCHEMA, cls.tpcds_tables)
+    tc = cls("test_execute_tpcds")
+    cost = []
+    for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
+        expression = te.parse_one(sql)
+        fn, args = pickle.loads(pickle.dumps((te.mp_execute, (expression, meta))))
+        t = time.process_time()
+        table = fn(*args)
+        if table is not None:
+            tc.subtestHelper(i, table, tpch=False)
+        cost.append(time.process_time() - t)
+    total = sum(cost)
+    json.dump([c / total for c in cost], open(out, "w"))
+    print("queries", len(cost), "total cpu %.1fs" % total, "largest share %.3f" % max(c / total for c in cost))
+
+
 def merge(out, trace, fps):
     runs = [json.load(open(p)) for p in fps]
     for r in runs[1:]:
@@ -118,6 +154,10 @@ def merge(out, trace, fps):
         for f, ls in json.load(open(path)).items():
             lines.setdefault(f, set()).update(ls)
     blob = {"base": runs[0], "lines": {f: frozenset(ls) for f, ls in lines.items()}}
+    qcost = os.environ.get("QCOST")
+    if qcost:   # per-query shares of the execution part (run_qcost), averaged over runs
+        runs_q = [json.load(open(p)) for p in qcost.split(",")]
+        blob["qshare"] = [max(q[i] for q in runs_q) for i in range(len(runs_q[0]))]
     with open(out, "wb") as fh:
         fh.write(zlib.compress(marshal.dumps(blob), 9))
     print("wrote", out, os.path.getsize(out), "bytes;", len(runs), "agreeing runs;",
@@ -130,5 +170,7 @@ if __name__ == "__main__":
         run_fp(sys.argv[2])
     elif mode == "trace":
         run_trace(sys.argv[2])
+    elif mode == "qcost":
+        run_qcost(sys.argv[2])
     else:
         merge(sys.argv[2], sys.argv[3], sys.argv[4:])
