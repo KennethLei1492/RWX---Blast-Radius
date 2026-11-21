@@ -51,6 +51,18 @@ def wall_left():
     return WALL - (time.monotonic() - T0)
 
 
+# Each stage below may run twice (see main): its time budget is shared by both passes.
+_SPENT: dict = {}
+
+
+def budget_left(key, default):
+    return float(os.environ.get(f"BLAST_{key.upper()}_BUDGET", default)) - _SPENT.get(key, 0.0)
+
+
+def spend(key, since):
+    _SPENT[key] = _SPENT.get(key, 0.0) + (time.monotonic() - since)
+
+
 PLAN_MIN_MS = 12000   # probe only when dropping test_execute_tpcds saves at least this much
 
 
@@ -97,13 +109,24 @@ def plan_check_commits(sel, tests, ms, patches, static):
     v = Verifier()
     if not v.start(heavy=len(todo) >= 2):
         return {}
-    import resource
 
     start = time.monotonic()
+    allowed = budget_left("plan", 60)
     results = {}
     imstate = None
+    try:
+        return _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static)
+    finally:
+        spend("plan", start)
+
+
+def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static):
+    import marshal
+    import resource
+    import zlib
+
     for saving, cid, at_import in sorted(todo, reverse=True):
-        if time.monotonic() - start > float(os.environ.get("BLAST_PLAN_BUDGET", "60")) or wall_left() < 45:
+        if time.monotonic() - start > allowed or wall_left() < 45:
             print(f"{cid}: no time left for the planning check", file=sys.stderr)
             continue
         c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -122,11 +145,11 @@ def plan_check_commits(sel, tests, ms, patches, static):
                       f"{'is unknown' if diff is None else 'differs'}; kept", file=sys.stderr)
                 continue
         # The probe may spend at most about what dropping the test saves: a wall-clock limit of
-        # 0.9 x the saving for planning, plus up to 0.4 x the saving (less the cost of loading
-        # the tables) for running the few queries whose plans changed.
+        # the saving for planning, plus up to 0.4 x the saving (less the cost of loading the
+        # tables) for running the few queries whose plans changed.
         saving_s = saving / 1000
         run_limit = max(0.0, 0.4 * saving_s - 2.0)
-        same = v.plan_same(patches[cid], blob["base"], timeout=min(60.0, 0.9 * saving_s + 2 * run_limit),
+        same = v.plan_same(patches[cid], blob["base"], timeout=min(60.0, saving_s + 2 * run_limit),
                            run_limit=run_limit, qshare=blob.get("qshare"), test_seconds=ms[num] / 1000)
         c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu = c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime
@@ -148,7 +171,7 @@ def verify_cheap_commits(sel, tests, ms, to_num, patches, static):
     from blast.verify import Verifier
 
     start = time.monotonic()
-    budget = float(os.environ.get("BLAST_VERIFY_BUDGET", min(110.0, 1.5 * max(len(patches), 1))))
+    budget = budget_left("verify", min(110.0, 1.5 * max(TOTAL_COMMITS[0], 1)))
     budget = min(budget, wall_left() - 8)
     v = Verifier()
     file_of = {t["number"]: t["file"] for t in tests}
@@ -178,6 +201,14 @@ def verify_cheap_commits(sel, tests, ms, to_num, patches, static):
     print(f"verifying {len(plans)} commits ({heavy_runs} with optimizer/executor tests)", file=sys.stderr)
 
     results = {}
+    try:
+        _verify_loop(plans, budget, start, v, patches, id_of, results)
+    finally:
+        spend("verify", start)
+    return results
+
+
+def _verify_loop(plans, budget, start, v, patches, id_of, results):
     for gain, cid, V, U, est in plans:
         left = budget - (time.monotonic() - start)
         if left < 2:
@@ -198,10 +229,10 @@ def verify_cheap_commits(sel, tests, ms, to_num, patches, static):
         kept = {num_of[i] for i in failed if i in num_of} | U
         print(f"{cid}: ran {len(V)} tests, {len(failed)} failed; printing {len(kept)}", file=sys.stderr)
         results[cid] = kept
-    return results
 
 
 ISD_MIN_MS = 3500   # only commits whose ordinary selection costs at least this much
+ISD_TABLE_MIN_MS = 2000   # a class or module table edit: its entries usually have few readers
 
 
 def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
@@ -214,7 +245,8 @@ def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
 
     from blast.verify import Verifier
 
-    todo = [c for c in static if uncertain.get(c) and c in patches and cost_ms(static[c], ms) >= ISD_MIN_MS]
+    todo = [c for c in static if uncertain.get(c) and c in patches
+            and cost_ms(static[c], ms) >= (ISD_TABLE_MIN_MS if uncertain[c] == "table" else ISD_MIN_MS)]
     if not todo:
         return {}
     try:
@@ -228,10 +260,18 @@ def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
     km = sel.key_map()
     tables = km["tables"] if km else None   # entry-level view of class-level dict tables
     start = time.monotonic()
+    allowed = budget_left("isd", 45)
     results = {}
-    file_of = {t["number"]: t["file"] for t in tests}
+    try:
+        _isd_loop(todo, start, allowed, v, base, tables, sel, patches, static, ms, to_num, results)
+    finally:
+        spend("isd", start)
+    return results
+
+
+def _isd_loop(todo, start, allowed, v, base, tables, sel, patches, static, ms, to_num, results):
     for cid in sorted(todo, key=lambda c: -cost_ms(static[c], ms)):
-        if time.monotonic() - start > float(os.environ.get("BLAST_ISD_BUDGET", "45")) or wall_left() < 70:
+        if time.monotonic() - start > allowed or wall_left() < 70:
             break
         diff = v.import_diff(patches[cid], base, timeout=20, tables=tables)
         if diff is None:
@@ -253,10 +293,46 @@ def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
         if cost_ms(alt, ms) < cost_ms(static[cid], ms):
             print(f"{cid}: import diff ({len(diff)} keys): {len(static[cid])} -> {len(alt)} tests", file=sys.stderr)
             results[cid] = alt
-    return results
 
 
 KNOWN: set = set()
+TOTAL_COMMITS = [0]
+
+
+def touched_files(patch):
+    import re
+
+    return set(re.findall(r"^\+\+\+ b/(\S+)", patch, re.M)) | set(re.findall(r"^--- a/(\S+)", patch, re.M))
+
+
+def core_files(sel):
+    """Source files that `import sqlglot` and `import tests.helpers` load (from the import map)."""
+    out = {"tests/__init__.py", "tests/helpers.py", "sqlglot/__init__.py"}
+    for mod, users in sel.m.get("rdeps", {}).items():
+        if mod == "sqlglot" or "sqlglot" in users:
+            base = mod.replace(".", "/")
+            out |= {base + ".py", base + "/__init__.py"}
+    return out
+
+
+def run_stages(sel, tests, ms, to_num, patches, static, uncertain, final):
+    """The stages that fork children of this process for some commits: the import diff, the
+    planning check and running cheap selections. `patches` holds the commits to handle."""
+    if not patches:
+        return
+    try:
+        static.update(import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain))
+    except Exception as e:  # the ordinary selections stand
+        print(f"import diff skipped: {e!r}", file=sys.stderr)
+    try:
+        static.update(plan_check_commits(sel, tests, ms, patches, static))
+    except Exception as e:  # the selections stand
+        print(f"planning check skipped: {e!r}", file=sys.stderr)
+    final.update({c: static[c] for c in patches})
+    try:
+        final.update(verify_cheap_commits(sel, tests, ms, to_num, patches, static))
+    except Exception as e:  # the static selections stand
+        print(f"verification skipped: {e!r}", file=sys.stderr)
 
 
 def main():
@@ -286,7 +362,7 @@ def main():
             with open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="replace") as fh:
                 patches[cid] = fh.read()
             bits, notes = sel.select(patches[cid])
-            uncertain[cid] = sel.uncertain or sel.table_edit
+            uncertain[cid] = "table" if sel.table_edit else sel.uncertain
             chosen = set()
             while bits:
                 low = bits & -bits
@@ -304,21 +380,30 @@ def main():
             chosen = set(every)
         static[cid] = chosen
 
-    try:
-        static.update(import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain))
-    except Exception as e:  # the ordinary selections stand
-        print(f"import diff skipped: {e!r}", file=sys.stderr)
-
-    try:
-        static.update(plan_check_commits(sel, tests, ms, patches, static))
-    except Exception as e:  # the selections stand
-        print(f"planning check skipped: {e!r}", file=sys.stderr)
-
+    # Every child that imports the patched tree starts with `import sqlglot`. Commits that
+    # change none of the files that import loads are handled after this process has done that
+    # import once (from the pinned tree, which for them is the patched one): their children
+    # start where a fresh child would be after its first import, without paying for it again.
+    # Commits that do change those files are handled first, while this process has imported
+    # nothing of sqlglot.
+    TOTAL_COMMITS[0] = len(commits)
     final = dict(static)
-    try:
-        final.update(verify_cheap_commits(sel, tests, ms, to_num, patches, static))
-    except Exception as e:  # the static selections stand
-        print(f"verification skipped: {e!r}", file=sys.stderr)
+    core = core_files(sel)
+    first = {c: p for c, p in patches.items() if touched_files(p) & core}
+    later = {c: p for c, p in patches.items() if c not in first}
+    run_stages(sel, tests, ms, to_num, first, static, uncertain, final)
+    if later:
+        from blast import verify
+
+        loaded = verify.preload_core()
+        if loaded is None:
+            later = {}   # no sqlglot tree: nothing to fork for
+        else:
+            surprise = loaded - core
+            if surprise:
+                print(f"import sqlglot loaded files the map does not list: {sorted(surprise)[:5]}", file=sys.stderr)
+            later = {c: p for c, p in later.items() if not touched_files(p) & loaded}
+    run_stages(sel, tests, ms, to_num, later, static, uncertain, final)
 
     for cid in commits:
         workers = pack(final[cid], ms)

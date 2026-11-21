@@ -7,12 +7,19 @@ TRANSFORMS and TYPE_MAPPING, a Parser's FUNCTIONS, a Tokenizer's KEYWORDS and NU
 tools/attr_trace.py records which tests load such an attribute, but a patch that changes one
 entry only matters to a test that looks that entry up (or reads the table as a whole).
 
-This tracer rewrites, at import, every assignment in a sqlglot class body or at module level
+This tracer rewrites, at import, every assignment in a sqlglot class body or at module level,
+and every assignment to a class attribute inside a function (the derived tables a metaclass
+builds, such as a tokenizer's keyword trie or a dialect's escape tables):
 
-    NAME = <value>      ->      NAME = __blast_table__(<value>, "NAME")
+    NAME = <value>        ->  NAME = __blast_table__(<value>, "NAME")
+    cls.NAME = <value>    ->  cls.NAME = __blast_attr_table__(cls, "NAME", <value>)
 
-and `__blast_table__` returns a dict subclass (same content) when the value is a plain dict,
-or a set / frozenset subclass when it is a plain set (KEY_SETS=0 turns sets off).
+and these return a dict subclass (same content) when the value is a plain dict, or a set /
+frozenset subclass when it is a plain set (KEY_SETS=0 turns sets off), or a list subclass for
+a plain list (KEY_LISTS=0), provided nothing else
+holds the value (otherwise reads through the other reference would go unrecorded). A nested
+dict held only by its parent is wrapped as part of the same table, and reads inside it are
+recorded by key path; the paths of those nested dicts go to _import.json ("nodes").
 The object is tracked wherever it flows (a Tokenizer hands its tables to the tokenizer core,
 for example), and records per test:
 
@@ -42,11 +49,12 @@ import sys
 
 ROOT = "/opt/sqlglot/"
 TABLES: list = []
-KEYED: set = set()      # (table, key) whose value was read: d[k], d.get(k)
-HAS: set = set()        # (table, key) whose presence was read: k in d
+KEYED: set = set()      # (table, key path) whose value was read: d[k], d.get(k)
+HAS: set = set()        # (table, key path) whose presence was read: k in d
+NODES: dict = {}        # table -> key paths of the nested dicts wrapped inside it
 WHOLE: set = set()
-LEN: set = set()        # tables whose number of entries was read: len(d)
-BOOLS: set = set()      # tables whose truth value was read: `if d`, `d or other`
+LEN: set = set()        # (table, node path) whose number of entries was read: len(d)
+BOOLS: set = set()      # (table, node path) whose truth value was read: `if d`, `d or other`
 
 
 def keyrepr(k):
@@ -77,27 +85,29 @@ def keyrepr(k):
 
 
 class TDict(dict):
-    __slots__ = ("_i",)
+    """A tracked dict: the whole table (_p == ()) or a nested dict inside it at key path _p."""
+
+    __slots__ = ("_i", "_p")
     __hash__ = None
 
     def __getitem__(self, k):
-        KEYED.add((self._i, k))
+        KEYED.add((self._i, self._p + (k,)))
         return dict.__getitem__(self, k)
 
     def get(self, k, default=None):
-        KEYED.add((self._i, k))
+        KEYED.add((self._i, self._p + (k,)))
         return dict.get(self, k, default)
 
     def __contains__(self, k):
-        HAS.add((self._i, k))
+        HAS.add((self._i, self._p + (k,)))
         return dict.__contains__(self, k)
 
     def __len__(self):
-        LEN.add(self._i)
+        LEN.add((self._i, self._p))
         return dict.__len__(self)
 
     def __bool__(self):
-        BOOLS.add(self._i)
+        BOOLS.add((self._i, self._p))
         return dict.__len__(self) > 0
 
     def __iter__(self):
@@ -201,12 +211,12 @@ class TCopy(TDict):
 
     def pop(self, *a):
         if a:
-            KEYED.add((self._i, a[0]))
+            KEYED.add((self._i, self._p + (a[0],)))
         return dict.pop(self, *a)
 
     def setdefault(self, *a):
         if a:
-            KEYED.add((self._i, a[0]))
+            KEYED.add((self._i, self._p + (a[0],)))
         return dict.setdefault(self, *a)
 
     def update(self, *a, **k):
@@ -230,6 +240,7 @@ def _copy(table):
     # subclass that overrides __iter__ would go through keys() and __getitem__)
     dict.update(c, dict.items(table))
     c._i = table._i
+    c._p = table._p
     return c
 
 
@@ -270,15 +281,15 @@ def _set_ns(base, extra=()):
     ns = _recording(base, _SET_READS + tuple(extra))
 
     def __contains__(self, k, _f=base.__contains__):
-        HAS.add((self._i, k))
+        HAS.add((self._i, (k,)))
         return _f(self, k)
 
     def __len__(self, _f=base.__len__):
-        LEN.add(self._i)
+        LEN.add((self._i, ()))
         return _f(self)
 
     def __bool__(self, _f=base.__len__):
-        BOOLS.add(self._i)
+        BOOLS.add((self._i, ()))
         return _f(self) > 0
 
     def __reduce_ex__(self, protocol, _it=base.__iter__):
@@ -302,9 +313,56 @@ _fz = _set_ns(frozenset)
 _fz["__hash__"] = _recording(frozenset, ("__hash__",))["__hash__"]
 TFrozen = type("TFrozen", (frozenset,), _fz)
 _TRACKED_SETS = (TSet, TFrozen)
-_TRACKED = (TSet, TFrozen, TDict, TCopy)
+
+
+class TList(list):
+    """A tracked list: an element read by index records that index (a negative index also
+    records the length), the length and the truth value are recorded as such, and everything
+    else (iteration, slices, searching, comparison, copying, any change) reads the whole list.
+    C code that is handed a list subclass reads it through these methods except in `x + lst`
+    (and `x += lst`), whose right operand the import rewriter marks."""
+
+    __slots__ = ("_i",)
+    __hash__ = None
+
+    def __getitem__(self, k):
+        if type(k) is int:
+            if k < 0:
+                LEN.add((self._i, ()))
+                k += list.__len__(self)
+            KEYED.add((self._i, (k,)))
+        else:
+            WHOLE.add(self._i)
+        return list.__getitem__(self, k)
+
+    def __len__(self):
+        LEN.add((self._i, ()))
+        return list.__len__(self)
+
+    def __bool__(self):
+        BOOLS.add((self._i, ()))
+        return list.__len__(self) > 0
+
+    def __reduce_ex__(self, protocol):
+        WHOLE.add(self._i)
+        return (list, (list(list.__iter__(self)),))
+
+    def __reduce__(self):
+        WHOLE.add(self._i)
+        return (list, (list(list.__iter__(self)),))
+
+
+for _n in ("__iter__", "__reversed__", "__contains__", "__eq__", "__ne__", "__lt__", "__le__", "__gt__",
+           "__ge__", "__add__", "__mul__", "__rmul__", "__iadd__", "__imul__", "__repr__",
+           "copy", "index", "count", "append", "extend", "insert", "remove", "pop", "clear", "sort",
+           "reverse", "__setitem__", "__delitem__"):
+    setattr(TList, _n, _recording(list, (_n,))[_n])
+del _n
+_TRACKED = (TSet, TFrozen, TDict, TCopy, TList)
+LISTS = os.environ.get("KEY_LISTS", "1") != "0"
 SETS = os.environ.get("KEY_SETS", "1") != "0"
 MODULE = os.environ.get("KEY_MODULE", "1") != "0"   # tables assigned at module level too
+DERIVED = os.environ.get("KEY_DERIVED", "1") != "0"  # tables a class gets assigned inside a function
 
 
 def _seen(x):
@@ -319,16 +377,63 @@ def _seen(x):
     return x
 
 
-def _table(value, name):
+def _probe2(value, name):
+    fresh = sys.getrefcount(value)
+    return fresh
+
+
+def _probe3(obj, name, value):
+    fresh = sys.getrefcount(value)
+    return fresh
+
+
+def _probe_nested(value):
+    for k in list(value):
+        v = dict.__getitem__(value, k)
+        refs = sys.getrefcount(v)
+        return refs
+
+
+# References a freshly built value has at the point where it is checked (the caller's stack,
+# the argument, the check itself): one more means something else holds it, and wrapping a copy
+# would let reads through that other reference go unrecorded.
+_FRESH2 = _probe2({}, "x")
+_FRESH3 = _probe3(None, "x", {})
+_FRESH_NESTED = _probe_nested({0: {}})
+
+
+def _wrap_dict(value, i, path):
+    """A TDict with value's entries; a nested plain dict held by value alone is wrapped too,
+    as part of the same table, so that reads inside it are recorded by key path (a keyword
+    trie is a nest of dicts, walked one character at a time)."""
+    new = TDict()
+    new._i = i
+    new._p = path
+    for k in list(value):
+        v = dict.__getitem__(value, k)
+        refs = sys.getrefcount(v)   # measured as _probe_nested measures it
+        if type(v) is dict and refs <= _FRESH_NESTED and keyrepr(k) is not None:
+            NODES.setdefault(i, set()).add(path + (k,))
+            v = _wrap_dict(v, i, path + (k,))
+        dict.__setitem__(new, k, v)
+    return new
+
+
+def _wrap(value, fresh):
     t = type(value)
     if t is dict:
-        new = TDict(value)
+        if not fresh:
+            return value
+        new = _wrap_dict(value, len(TABLES), ())
     elif t is TCopy:
-        # `NAME = OTHER.copy()` in a class body or at module level: a table of its own
+        # `NAME = OTHER.copy()`: a table of its own (its nested values stay shared)
         new = TDict(dict.items(value))
-    elif SETS and t is set:
+        new._p = ()
+    elif LISTS and t is list and fresh:
+        new = TList(value)
+    elif SETS and t is set and fresh:
         new = TSet(value)
-    elif SETS and t is frozenset:
+    elif SETS and t is frozenset and fresh:
         new = TFrozen(value)
     else:
         return value
@@ -337,7 +442,22 @@ def _table(value, name):
     return new
 
 
+def _table(value, name):
+    fresh = sys.getrefcount(value) <= _FRESH2   # measured as _probe2 measures it
+    return _wrap(value, fresh)
+
+
+def _attr_table(obj, name, value):
+    """`Name.ATTR = value` inside a function (a metaclass building a class's derived tables,
+    such as a tokenizer's keyword trie): tracked like a class-body table when obj is a class."""
+    if not isinstance(obj, type) or name == "arg_types" or (name.startswith("__") and name.endswith("__")):
+        return value
+    fresh = sys.getrefcount(value) <= _FRESH3   # measured as _probe3 measures it
+    return _wrap(value, fresh)
+
+
 builtins.__blast_table__ = _table
+builtins.__blast_attr_table__ = _attr_table
 builtins.__blast_dictcopy__ = _dictcopy
 builtins.__blast_seen__ = _seen
 
@@ -365,6 +485,17 @@ class _Rewrite(ast.NodeTransformer):
             self._block(node.body)
         return node
 
+    def visit_Assign(self, node):
+        self.generic_visit(node)
+        t = node.targets[0] if len(node.targets) == 1 else None
+        if (self.tables and DERIVED and isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                and isinstance(t.ctx, ast.Store)):
+            node.value = ast.copy_location(
+                ast.Call(func=ast.Name(id="__blast_attr_table__", ctx=ast.Load()),
+                         args=[ast.Name(id=t.value.id, ctx=ast.Load()), ast.Constant(t.attr), node.value],
+                         keywords=[]), node.value)
+        return node
+
     def visit_Call(self, node):
         self.generic_visit(node)
         f = node.func
@@ -372,8 +503,10 @@ class _Rewrite(ast.NodeTransformer):
                 and not isinstance(node.args[0], ast.Starred)):
             node.func = ast.copy_location(ast.Name(id="__blast_dictcopy__", ctx=ast.Load()), f)
         elif SETS and ((isinstance(f, ast.Name) and f.id in ("set", "frozenset"))
-                       or (isinstance(f, ast.Attribute) and f.attr in _SET_ARG_METHODS)):
-            # C code will read a set passed here without calling its methods
+                       or (isinstance(f, ast.Attribute) and (f.attr in _SET_ARG_METHODS or (
+                           f.attr.startswith("__") and f.attr.endswith("__"))))):
+            # C code will read a set passed here without calling its methods (an explicit
+            # dunder call such as [].__add__(x) reads a list argument the same way)
             node.args = [self._mark(a) for a in node.args]
         return node
 
@@ -388,7 +521,7 @@ class _Rewrite(ast.NodeTransformer):
         # `plain | table`, `table_a - table_b`: Python only calls the right operand's method
         # when its type is a subclass of the left one's, so a set against a frozenset, or two
         # tables, would be read by C code unseen
-        if SETS and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)) \
+        if SETS and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor, ast.Add)) \
                 and not isinstance(node.right, ast.Constant):
             node.right = self._mark(node.right)
         return node
@@ -404,7 +537,7 @@ class _Rewrite(ast.NodeTransformer):
 
     def visit_AugAssign(self, node):
         self.generic_visit(node)
-        if SETS and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)):
+        if SETS and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor, ast.Add)):
             node.value = self._mark(node.value)
         return node
 
@@ -473,15 +606,38 @@ def table_index():
         if mod is None or not (mname == "sqlglot" or mname.startswith("sqlglot.")):
             continue
         for attr, v in list(vars(mod).items()):
-            if type(v) is TDict or type(v) in _TRACKED_SETS:
+            if (type(v) is TDict and v._p == ()) or type(v) in _TRACKED_SETS or type(v) is TList:
                 index.setdefault(v._i, []).append(f"{mname}:{attr}")
     for cls in [o for o in gc.get_objects() if isinstance(o, type)]:
         if not (getattr(cls, "__module__", "") or "").startswith("sqlglot"):
             continue
         for attr, v in list(vars(cls).items()):
-            if type(v) is TDict or type(v) in _TRACKED_SETS:
+            if (type(v) is TDict and v._p == ()) or type(v) in _TRACKED_SETS or type(v) is TList:
                 index.setdefault(v._i, []).append(f"{cls.__module__}:{cls.__qualname__}.{attr}")
     return index
+
+
+def pathname(path):
+    """Name of a key path: the key's own name for a top-level key; for a key inside a nested
+    dict, "P:" and the names of the keys along the path joined by \x1f, so that the name of a
+    path's parent node is the name with its last part cut off (see parent_name). None if a key
+    has no stable name. (Same function in tools/key_trace.py and blast/keytab.py.)"""
+    parts = [keyrepr(x) for x in path]
+    if any(p is None for p in parts):
+        return None
+    if len(parts) == 1:
+        return parts[0]   # a top-level name is never split, whatever it holds
+    if any("\x1f" in p for p in parts):
+        return None
+    return "P:" + "\x1f".join(parts)
+
+
+def parent_name(name):
+    """Name of the node that holds the entry `name`: "" for the table itself."""
+    if not name.startswith("P:"):
+        return ""
+    head = name[2:].rsplit("\x1f", 1)[0]
+    return head if "\x1f" not in head else "P:" + head
 
 
 def dump_reads():
@@ -489,16 +645,23 @@ def dump_reads():
     out = {}
     for label, pairs in (("keyed", KEYED), ("has", HAS)):
         got = set()
-        for i, k in pairs:
-            r = keyrepr(k)
+        for i, path in pairs:
+            r = pathname(path)
             if r is None:
                 whole.add(i)   # a key without a stable name: count the table as read whole
             else:
                 got.add((i, r))
         out[label] = sorted(got)
+    for label, pairs in (("len", LEN), ("bool", BOOLS)):
+        got = set()
+        for i, path in pairs:
+            r = pathname(path) if path else ""
+            if r is None:
+                whole.add(i)
+            else:
+                got.add((i, r))
+        out[label] = sorted(got)
     out["whole"] = sorted(whole)
-    out["len"] = sorted(LEN)
-    out["bool"] = sorted(BOOLS)
     return out
 
 
@@ -528,7 +691,9 @@ def main():
                 print(f"cannot import {info.name}: {e}", file=sys.stderr)
     index = table_index()
     imp = dump_reads()
-    json.dump({"tables": {str(i): v for i, v in sorted(index.items())}, "import": imp, "created": len(TABLES)},
+    nodes = {str(i): sorted(filter(None, (pathname(x) for x in NODES.get(i, ())))) for i in index}
+    json.dump({"tables": {str(i): v for i, v in sorted(index.items())}, "import": imp, "created": len(TABLES),
+               "nodes": {i: v for i, v in nodes.items() if v}},
               open(os.path.join(out_dir, "_import.json"), "w"))
     print(f"{len(TABLES)} tables wrapped ({sum(1 for x in TABLES if type(x) is TDict)} dicts), "
           f"{len(index)} are class attributes "

@@ -85,18 +85,32 @@ presence read of that element, anything else reads the whole set, and since C co
 handed a set (`set(x)`, `a.update(x)`, `a.issubset(x)`, `{*x}`, `a |= x`, the right operand
 of `a | x`, `a - x`, `a == x`, `a <= x`) reads it without calling any of its methods, the
 tracer's import rewriter marks those places in sqlglot and in the tests.
-`tools/key_selftest.py` runs 156 ways of reading a dict or a set through the rewritten source
-and checks that each leaves a sufficient record. Tables assigned at module level are traced as well, which matters most for the
-type-annotation tables in `sqlglot/typing/*.py` that every dialect copies at import. 847
-tables with 83,420 entries are traced this way; a table that a metaclass replaces, or that is
-neither a plain dict nor a plain set, keeps the attribute-level rule.
+Lists are traced too (an element read by index records that index; a negative index, the
+length; `bool(lst)`, only the truth value; anything else, the whole list), which matters for
+settings such as a tokenizer's `HEX_STRINGS` that tests only test for emptiness.
+Tables assigned at module level are traced as well, which matters most for the
+type-annotation tables in `sqlglot/typing/*.py` that every dialect copies at import, and so
+are the tables a metaclass builds from the class body and assigns inside a function
+(`cls._KEYWORD_TRIE = new_trie(...)`, `klass.ESCAPED_SEQUENCES = {...}`, `_FORMAT_STRINGS`,
+the merged `UNESCAPED_SEQUENCES`, time-format tries). A nested dict held only by its parent is
+traced as part of the same table, by key path: the tokenizer walks its keyword trie one
+character at a time (`trie.get(char)`, `0 in trie`), so a test depends on a changed keyword
+only if the text it tokenized led it into that branch. A value is wrapped only when nothing
+else holds it (checked by reference count), since a read through another reference would go
+unrecorded; the tracer lists the nested dicts it wrapped, and the import diff enters exactly
+those and treats anything else as one value. `tools/key_selftest.py` runs 216 ways of reading
+a dict, a set, a list or a trie through the rewritten source and checks that each leaves a
+sufficient record. 2,834 tables with 117,549 entries are traced this way; anything else keeps
+the attribute-level rule.
 When the import diff reports such a table as changed, the child also compares it entry by
 entry with fingerprints of the pinned entries, and the table's readers become: the tests
 that read the value of a changed entry, those that read the value or presence of an added or
 removed key, those that read the length if it changed (or its truth value, if it became
 empty or stopped being empty), and those that read it whole. On the
 official sample set this takes `4d63` (one value inside Snowflake's `NUMERIC_ESCAPES`) from
-273 tests to none. Checked with `tools/recheck_isd.py` on the 986 labeled commits and on
+273 tests to none; renaming one BigQuery keyword goes from 222 tests to 1. For a table edit the
+import diff runs whenever the ordinary selection is not empty (otherwise only when it costs
+3.5 s or more). Checked with `tools/recheck_isd.py` on the 986 labeled commits and on
 table mutations made for this (`tools/mutate_tables.py`: one element of a set, or one key or
 value of a dict, replaced by another of the same table), labeled by running every reader:
 no known-failing test left out.
@@ -132,6 +146,16 @@ of this when their own selection does not hold the test; the probe still runs on
 patch. Checked with `tools/check_tpcds.py` on 115 labeled commits that select the test: it
 was dropped in 41, none of which fails it (5 of them by running 1 to 6 differing queries),
 and kept in all 48 where it fails.
+
+**Children start after `import sqlglot` (`selector.run_stages`, `verify.preload_core`).** Every
+child that imports the patched tree (an import diff, a planning check, a test run) starts with
+`import sqlglot`, which loads 36 modules. Most patches change none of them (27 of the 30
+sample commits). The selector first does all the work for commits that do change them, then
+imports sqlglot and `tests.helpers` once in its own process, from the pinned tree and after
+the same set-up a child gets (`SKIP_INTEGRATION`, `unittest` loaded: sqlglot records at import
+whether it is), and forks the children for every other commit from there. They start where a
+fresh child is after its first import, without paying for it. Checked by fingerprinting
+everything an unpatched import leaves behind through both paths: identical, key for key.
 
 **Running cheap selections (`blast/verify.py`, `blast/policy.py`).** The rules allow running
 sqlglot's tests while deciding (the CPU is charged). For a commit whose selection is cheap

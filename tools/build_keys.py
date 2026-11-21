@@ -9,7 +9,8 @@ drops any table whose fingerprints differ between runs.
 
 keys.bin: {"tables": {"module:Class.ATTR": {"entries": {key: fingerprint}, "keyed": {key: bits
 of tests that read the key's value}, "has": {key: bits of tests that only asked whether the key
-is there}, "whole": bits, "len": bits, "bool": bits}}, "unprofiled": bits}.
+is there}, "whole": bits, "len": bits, "bool": bits (of the table itself), "lenp" / "boolp":
+{nested node name: bits}, "nodes": names of nested dicts entered by path}}, "unprofiled": bits}.
 """
 import json
 import marshal
@@ -22,7 +23,7 @@ sys.path.insert(0, HERE)
 ROOT = os.environ.get("BLAST_SQLGLOT", "/opt/sqlglot")
 
 
-def _entries_child(names):
+def _entries_child(names, nodes_of):
     import importlib
     import pkgutil
 
@@ -39,7 +40,7 @@ def _entries_child(names):
             importlib.import_module(info.name)
     out = {}
     for n in names:
-        e = keytab.entries(keytab.resolve(n))
+        e = keytab.entries(keytab.resolve(n), None, nodes_of.get(n))
         out[n] = None if e is None else {k: v.hex() for k, v in e.items()}
     return out
 
@@ -49,9 +50,10 @@ def run_entries(key_dir, out):
 
     imp = json.load(open(os.path.join(key_dir, "_import.json")))
     names = sorted({n for v in imp["tables"].values() for n in v})
+    nodes_of = {n: set(imp.get("nodes", {}).get(i, ())) for i, v in imp["tables"].items() for n in v}
     v = verify.Verifier(ROOT)
     v.start(heavy=False)
-    got = v._fork(lambda: _entries_child(names), 300)
+    got = v._fork(lambda: _entries_child(names, nodes_of), 600)
     json.dump(got, open(out, "w"))
     print(len(names), "tables,", sum(1 for x in got.values() if x is None), "not comparable,",
           sum(len(x) for x in got.values() if x), "entries")
@@ -91,17 +93,25 @@ def merge(key_dir, tests_json, out, entry_files):
             has[i][k] = has[i].get(k, 0) | bit
         for i in d["whole"]:
             whole[i] = whole.get(i, 0) | bit
-        for i in d["len"]:
-            lens[i] = lens.get(i, 0) | bit
-        for i in d.get("bool", ()):
-            bools[i] = bools.get(i, 0) | bit
+        for i, node in d["len"]:
+            lens.setdefault(i, {})
+            lens[i][node] = lens[i].get(node, 0) | bit
+        for i, node in d.get("bool", ()):
+            bools.setdefault(i, {})
+            bools[i][node] = bools[i].get(node, 0) | bit
     tables = {}
     for i, names in names_of.items():
         for name in names:
             if name not in stable:
                 continue
+            ln = dict(lens.get(i, {}))
+            bl = dict(bools.get(i, {}))
             tables[name] = {"entries": stable[name], "keyed": keyed.get(i, {}), "has": has.get(i, {}),
-                            "whole": whole.get(i, 0), "len": lens.get(i, 0), "bool": bools.get(i, 0)}
+                            "whole": whole.get(i, 0), "len": ln.pop("", 0), "bool": bl.pop("", 0),
+                            "lenp": ln, "boolp": bl}
+            nd = imp.get("nodes", {}).get(str(i))
+            if nd:
+                tables[name]["nodes"] = frozenset(nd)
     blob = {"tables": tables, "unprofiled": unprofiled}
     with open(out, "wb") as fh:
         fh.write(zlib.compress(marshal.dumps(blob), 9))

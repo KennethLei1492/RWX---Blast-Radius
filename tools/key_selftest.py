@@ -113,16 +113,146 @@ def satisfied(want, d, s, f):
         return True   # a whole read covers everything
     if want == "whole":
         return False
+    lens = {i for i, _ in kt.LEN}
+    bools = {i for i, _ in kt.BOOLS}
     if want == "len":
-        return bool(ids & kt.LEN)
+        return bool(ids & lens)
     if want == "bool":
-        return bool(ids & (kt.BOOLS | kt.LEN))
+        return bool(ids & (bools | lens))
     kind, _, key = want.partition(":")
     for k in (key, int(key) if key.isdigit() else key):
         for i in ids:
-            if (i, k) in kt.KEYED or (kind == "has" and (i, k) in kt.HAS):
+            if (i, (k,)) in kt.KEYED or (kind == "has" and (i, (k,)) in kt.HAS):
                 return True
     return False
+
+
+# ------------------------------------------------------------ lists
+LIST_CASES = [
+    ("x[0]", "keyed:0"), ("x[1]", "keyed:1"), ("x[-1]", "len"), ("len(x)", "len"), ("bool(x)", "bool"),
+    ("1 if x else 2", "bool"), ("x or []", "bool"), ("list(x)", "whole"), ("tuple(x)", "whole"),
+    ("sorted(x)", "whole"), ("[*x]", "whole"), ("(*x,)", "whole"), ("set(x)", "whole"),
+    ("'a' in x", "whole"), ("x[0:1]", "whole"), ("x.index('a')", "whole"), ("x.count('a')", "whole"),
+    ("x + ['z']", "whole"), ("['z'] + x", "whole"), ("x * 2", "whole"), ("x == ['a', 'b']", "whole"),
+    ("['a', 'b'] == x", "whole"), ("x != []", "whole"), ("[] < x", "whole"), ("max(x)", "whole"),
+    ("','.join(x)", "whole"), ("repr(x)", "whole"), ("str(x)", "whole"), ("list(reversed(x))", "whole"),
+    ("__import__('json').dumps(x)", "whole"), ("__import__('copy').copy(x)", "whole"),
+    ("__import__('pickle').dumps(x)", "whole"), ("dict.fromkeys(x)", "whole"), ("{*x}", "whole"),
+    ("(lambda *a: a)(*x)", "whole"), ("x.copy()", "whole"), ("any(x)", "whole"), ("enumerate(x).__next__()", "whole"),
+    ("next(iter(x))", "whole"), ("__import__('itertools').chain(x).__next__()", "whole"),
+    ("{'a': 1}.keys() & x", "whole"), ("{e: 1 for e in x}", "whole"),
+    ("__import__('collections').Counter(x)", "whole"), ("[].__add__(x)", "whole"),
+]
+LIST_STATEMENTS = [("y = []; y += x", "whole"), ("y = []; y.extend(x)", "whole"), ("a, b = x", "whole"),
+                   ("a, *b = x", "whole"), ("for e in x: pass", "whole"), ("y = list(); y[:] = x", "whole")]
+
+
+def list_check():
+    bad = 0
+    for src, want, stmt in [(a, b, False) for a, b in LIST_CASES] + [(a, b, True) for a, b in LIST_STATEMENTS]:
+        for store in (kt.KEYED, kt.HAS, kt.WHOLE, kt.LEN, kt.BOOLS):
+            store.clear()
+        x = kt._table(["a", "b"], "X")
+        if type(x) is not kt.TList:
+            print("NOT WRAPPED: a fresh list")
+            return bad + 1
+        tree = ast.parse(src, mode="exec" if stmt else "eval")
+        rw = kt._Rewrite()
+        rw.tables = False
+        tree = ast.fix_missing_locations(rw.visit(tree))
+        try:
+            if stmt:
+                exec(compile(tree, "<case>", "exec"), {"x": x})
+            else:
+                eval(compile(tree, "<case>", "eval"), {"x": x})
+        except Exception as e:  # noqa: BLE001
+            print("ERROR", src, repr(e))
+            bad += 1
+            continue
+        i = x._i
+        if i in kt.WHOLE:
+            ok = True
+        elif want == "whole":
+            ok = False
+        elif want == "len":
+            ok = any(j == i for j, _ in kt.LEN)
+        elif want == "bool":
+            ok = any(j == i for j, _ in kt.BOOLS | kt.LEN)
+        else:
+            ok = (i, (int(want.split(":")[1]),)) in kt.KEYED
+        if not ok:
+            bad += 1
+            print("NOT RECORDED (list):", src, "needs", want)
+    return bad
+
+
+# ------------------------------------------------------------ nested dicts (a keyword trie)
+TRIE_CASES = [
+    # (source, key paths that must be recorded for table t, as keyed (k) or presence (h) reads)
+    ("t['S']['E']", [("k", ("S",)), ("k", ("S", "E"))]),
+    ("t.get('S').get('X')", [("k", ("S",)), ("k", ("S", "X"))]),
+    ("0 in t['S']['E']", [("k", ("S", "E")), ("h", ("S", "E", 0))]),
+    ("dict(t['S'])['E']", [("k", ("S", "E"))]),
+    ("t['S'].copy().get('Q')", [("k", ("S", "Q"))]),
+]
+
+
+def trie_check():
+    bad = 0
+    for src, want in TRIE_CASES:
+        for store in (kt.KEYED, kt.HAS, kt.WHOLE, kt.LEN, kt.BOOLS):
+            store.clear()
+        t = kt._table({"S": {"E": {0: True, "L": {0: True}}}, "F": {0: True}}, "T")
+        eval(compile(ast.parse(src, mode="eval"), "<case>", "eval"), {"t": t})
+        for kind, path in want:
+            if (t._i, path) not in (kt.KEYED if kind == "k" else kt.KEYED | kt.HAS) and t._i not in kt.WHOLE:
+                bad += 1
+                print("NOT RECORDED (trie):", src, kind, path)
+    # truth and length of a nested dict are recorded for that node
+    for store in (kt.KEYED, kt.HAS, kt.WHOLE, kt.LEN, kt.BOOLS):
+        store.clear()
+    t = kt._table({"S": {"E": {0: True}}}, "T")
+    bool(t["S"])
+    len(t["S"]["E"])
+    if (t._i, ("S",)) not in kt.BOOLS or (t._i, ("S", "E")) not in kt.LEN:
+        bad += 1
+        print("NOT RECORDED (trie): truth or length of a nested node")
+    if kt.parent_name(kt.pathname(("S", "E", 0))) != kt.pathname(("S", "E")) or \
+            kt.parent_name(kt.pathname(("S", "E"))) != kt.pathname(("S",)) or kt.parent_name(kt.pathname(("S",))) != "":
+        bad += 1
+        print("WRONG parent names")
+    # iterating a nested dict reads the whole table
+    for store in (kt.KEYED, kt.HAS, kt.WHOLE):
+        store.clear()
+    t = kt._table({"S": {"E": {0: True}}}, "T")
+    list(t["S"])
+    if t._i not in kt.WHOLE:
+        bad += 1
+        print("NOT RECORDED (trie): iteration of a nested dict")
+    # a nested dict that something else also holds is not wrapped (its reads would escape)
+    shared = {"x": 1}
+    keep = [shared]
+    t = kt._table({"A": shared}, "T")
+    if type(dict.__getitem__(t, "A")) is not dict:
+        bad += 1
+        print("WRAPPED a shared nested dict")
+    # a table value that something else holds is not wrapped either
+    other = {"y": 2}
+    if kt._table(other, "U") is not other:
+        bad += 1
+        print("WRAPPED a shared table")
+    # a class attribute assigned inside a function is tracked; an instance attribute is not
+    class K:
+        pass
+    k = K()
+    if type(kt._attr_table(K, "X", {"a": 1})) is not kt.TDict:
+        bad += 1
+        print("NOT WRAPPED: class attribute assigned in a function")
+    if type(kt._attr_table(k, "X", {"a": 1})) is not dict:
+        bad += 1
+        print("WRAPPED: instance attribute")
+    del keep
+    return bad
 
 
 bad = 0
@@ -144,5 +274,8 @@ for src, want in STATEMENTS:
     if not ok:
         bad += 1
         print("NOT RECORDED:", src, "needs", want)
-print(f"{len(CASES) + len(STATEMENTS)} cases, {bad} not recorded")
+bad += trie_check()
+bad += list_check()
+print(f"{len(CASES) + len(STATEMENTS) + len(TRIE_CASES) + 5 + len(LIST_CASES) + len(LIST_STATEMENTS)} cases, "
+      f"{bad} not recorded")
 sys.exit(1 if bad else 0)

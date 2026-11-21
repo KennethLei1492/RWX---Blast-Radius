@@ -206,6 +206,32 @@ class Verifier:
             return None
 
 
+def preload_core(root=SRC):
+    """Import sqlglot and tests.helpers into this process from the pinned tree, as a child
+    would first do (same path and working directory), so that children forked afterwards for
+    patches that change none of these files skip that import. Returns the set of source files
+    (relative to root) it loaded, or None if there is no tree."""
+    if not os.path.isdir(os.path.join(root, "sqlglot")):
+        return None
+    # The child's environment first: start() sets SKIP_INTEGRATION (tests.helpers reads it) and
+    # imports unittest, which sqlglot.expressions checks at import (its UNITTEST flag).
+    if not Verifier(root).start(heavy=False):
+        return None
+    before = set(sys.modules)
+    sys.path.insert(0, root)
+    os.chdir(root)
+    import sqlglot  # noqa: F401
+    import tests.helpers  # noqa: F401
+
+    out = set()
+    prefix = root.rstrip("/") + "/"
+    for name in set(sys.modules) - before:
+        f = getattr(sys.modules[name], "__file__", None) or ""
+        if f.startswith(prefix):
+            out.add(f[len(prefix):])
+    return out
+
+
 def _line_map(applied):
     """new line number -> pinned line number for a patched file."""
     table = {}
@@ -273,7 +299,7 @@ def _import_child(root, files, line_maps, baseline, tables=None):
         t = tables.get(k)
         if t is not None:
             try:
-                entry[k] = keytab.entry_diff(k, t["entries"], line_maps)
+                entry[k] = keytab.entry_diff(k, t["entries"], line_maps, t.get("nodes"))
             except Exception:  # noqa: BLE001  -- not comparable: the attribute rule stands
                 entry[k] = None
     return {"diff": diff, "entry": entry}

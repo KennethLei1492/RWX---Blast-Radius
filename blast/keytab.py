@@ -46,6 +46,33 @@ def keyrepr(k):
     return None
 
 
+def pathname(path):
+    """Name of a key path: the key's own name for a top-level key; for a key inside a nested
+    dict, "P:" and the names of the keys along the path joined by \x1f, so that the name of a
+    path's parent node is the name with its last part cut off (see parent_name). None if a key
+    has no stable name. (Same function in tools/key_trace.py and blast/keytab.py.)"""
+    parts = [keyrepr(x) for x in path]
+    if any(p is None for p in parts):
+        return None
+    if len(parts) == 1:
+        return parts[0]   # a top-level name is never split, whatever it holds
+    if any("\x1f" in p for p in parts):
+        return None
+    return "P:" + "\x1f".join(parts)
+
+
+def parent_name(name):
+    """Name of the node that holds the entry `name`: "" for the table itself."""
+    if not name.startswith("P:"):
+        return ""
+    head = name[2:].rsplit("\x1f", 1)[0]
+    return head if "\x1f" not in head else "P:" + head
+
+
+class _Unnamed(Exception):
+    pass
+
+
 def resolve(name):
     """The object behind "module:Class.Inner.ATTR" (looked up in the class's own __dict__) or
     behind "module:NAME" (a module global)."""
@@ -65,10 +92,12 @@ def resolve(name):
     return vars(o).get(path[-1])
 
 
-def entries(table, line_maps=None):
-    """{key name: fingerprint} of a dict (or {element name: marker} of a set); None if it is
-    neither or a key has no stable name. Each value is fingerprinted on its own, so the result does not depend on the
-    order of the entries or on which other entries exist."""
+def entries(table, line_maps=None, nodes=None):
+    """{key name: fingerprint} of a dict ({element name: marker} of a set, {index: fingerprint}
+    of a list); None if it is none of these or a key has no stable name. Each value is fingerprinted on its own, so the result
+    does not depend on the order of the entries or on which other entries exist. A nested dict
+    at a key path named in `nodes` (the ones the tracer recorded reads inside) is entered: it
+    counts as an entry of its own (a marker) and so does each of its keys, by path."""
     if type(table) in (set, frozenset):
         out = {}
         for k in table:
@@ -77,25 +106,45 @@ def entries(table, line_maps=None):
                 return None
             out[r] = b"\x01"   # an element has no value: only its presence can change
         return out
+    if type(table) is list:
+        # an element by its index (what an indexed read records); the length is compared too
+        return {keyrepr(i): Walker(line_maps).fp(v) for i, v in enumerate(table)}
     if type(table) is not dict:
         return None
     out = {}
-    for k, v in table.items():
-        r = keyrepr(k)
-        if r is None or r in out:
-            return None
-        out[r] = Walker(line_maps).fp(v)
+
+    def walk(d, path):
+        for k, v in d.items():
+            p = path + (k,)
+            r = pathname(p)
+            if r is None or r in out:
+                raise _Unnamed()
+            if nodes and type(v) is dict and r in nodes:
+                out[r] = b"\x02"
+                walk(v, p)
+            else:
+                out[r] = Walker(line_maps).fp(v)
+
+    try:
+        walk(table, ())
+    except (_Unnamed, RecursionError):
+        return None
     return out
 
 
-def entry_diff(name, pinned, line_maps=None):
+def entry_diff(name, pinned, line_maps=None, nodes=None):
     """{"keys": [entries whose value changed], "gone": [entries added or removed], "len":
-    whether the number of entries changed, "empty": whether it became empty or stopped being
-    empty}, or None if the patched table cannot be compared entry by entry."""
-    now = entries(resolve(name), line_maps)
+    whether the number of top-level entries changed, "empty": whether the table became empty or
+    stopped being empty, "parents": nested nodes that gained or lost an entry}, or None if the
+    patched table cannot be compared entry by entry."""
+    now = entries(resolve(name), line_maps, nodes)
     if now is None:
         return None
     keys = sorted(k for k in set(now) & set(pinned) if now[k] != pinned[k])
     gone = sorted(set(now) ^ set(pinned))
-    return {"keys": keys, "gone": gone, "len": len(now) != len(pinned),
-            "empty": (not now) != (not pinned)}
+    top_now = sum(1 for k in now if not k.startswith("P:"))
+    top_pinned = sum(1 for k in pinned if not k.startswith("P:"))
+    return {"keys": keys, "gone": gone, "len": top_now != top_pinned,
+            "empty": (top_now == 0) != (top_pinned == 0),
+            # nested nodes that gained or lost an entry: their length and truth readers count
+            "parents": sorted({parent_name(k) for k in gone} - {""})}

@@ -547,6 +547,11 @@ class Selector:
                         b |= t["len"]
                     if e["len"] and (e.get("empty", True) or "bool" not in t):
                         b |= t.get("bool", 0)   # truth value: only emptiness matters
+                    if "lenp" in t:
+                        for pn in e.get("parents", ()):   # nested nodes that gained or lost an entry
+                            b |= t["lenp"].get(pn, 0) | t["boolp"].get(pn, 0)
+                    elif e["gone"] and t.get("nodes"):
+                        b |= t.get("len", 0) | t.get("bool", 0)
                     for name in e["keys"]:
                         b |= t["keyed"].get(name, 0)
                     for name in e["gone"]:
