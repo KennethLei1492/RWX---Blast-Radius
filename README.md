@@ -176,6 +176,15 @@ on the lines those phases run. When no changed key is among them (a class attrib
 recorded nor named there, a module global never named there), the execution part reads none
 of the change, and the same planning probe decides the test.
 
+**Edits that run while queries execute (`maps/tpcds.bin` "xlines", `selector.queries_executing`).**
+An edited function that runs in the execution part used to keep the test outright. The map
+also records, per query, the lines its execution runs (`tools/build_tpcds.py qexec`, all
+queries in order in one process). When the edited statements run in the execution of only a
+few queries, cheap enough to run within the probe's budget, and never in the class set-up or
+on an execution line no single query is credited with, the probe runs those queries for real
+(whatever their plans), the edited code being expected there; every other query keeps the
+argument above.
+
 **Only the queries an edit reaches (`maps/tpcds.bin` "qlines", `selector.queries_reaching`).**
 Planning the queries is nearly all of the probe (sqlglot's optimizer about half, the
 fingerprints a fifth), yet an edited statement is often run by only some of them, and an edit

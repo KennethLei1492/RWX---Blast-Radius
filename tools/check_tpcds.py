@@ -20,7 +20,24 @@ os.environ.setdefault("SKIP_INTEGRATION", "0")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 from blast import planfp, verify  # noqa: E402
 from blast.select import Selector  # noqa: E402
-from selector import queries_reaching, read_in_execution  # noqa: E402
+from selector import queries_executing, queries_reaching, read_in_execution  # noqa: E402
+
+
+def _share(blob, mask):
+    qs = blob.get("qshare") or [1.0] * 99
+    return sum(qs[i] for i in range(mask.bit_length()) if mask >> i & 1)
+
+
+def _forceable(blob, sel, bits, bit):
+    """The selector's condition (selector.plan_check_commits) for running only the queries
+    whose execution reaches the edited statements."""
+    force = queries_executing(blob, sel.body_spans)
+    if force is None:
+        return False
+    saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
+    limit = max(0.0, float(os.environ.get("RUN_FRAC", "0.4")) * saving_s - 2.0)
+    return bin(force).count("1") <= int(os.environ.get("COLLECT", "6")) and \
+        _share(blob, force) * sel.ms[bit] / 1000 <= limit
 
 
 def main():
@@ -64,9 +81,9 @@ def main():
                 same = None
                 if hit is None:
                     saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
-                    run_limit = max(0.0, 0.4 * saving_s - 2.0)
+                    run_limit = max(0.0, float(os.environ.get("RUN_FRAC", "0.4")) * saving_s - 2.0)
                     same = v.plan_same(patch, base, 300, run_limit=run_limit, qshare=blob.get("qshare"),
-                                       test_seconds=sel.ms[bit] / 1000)
+                                       test_seconds=sel.ms[bit] / 1000, collect=int(os.environ.get("COLLECT", "6")))
                 r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 c = r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime
                 cpu += c
@@ -78,9 +95,13 @@ def main():
                       f"first difference {getattr(v, 'plan_at', None)}", flush=True)
             elif spans is None:
                 what = "kept, not eligible"
-            elif any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
+            elif any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss) and \
+                    not _forceable(blob, sel, bits, bit):
                 what = "kept, runs in execution"
             else:
+                force = None
+                if any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
+                    force = queries_executing(blob, sel.body_spans)
                 r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 same = None
                 expected = set(sel.body_expected)
@@ -91,9 +112,15 @@ def main():
                     # the selector's limits (selector.plan_check_commits), with a long timeout
                     # so that a loaded machine does not hide a wrong answer behind "unknown"
                     saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
-                    run_limit = max(0.0, 0.4 * saving_s - 2.0)
+                    run_limit = max(0.0, float(os.environ.get("RUN_FRAC", "0.4")) * saving_s - 2.0)
+                    n_forced = bin(force).count("1") if force else 0
+                    if force:
+                        run_limit = max(0.0, run_limit - sel.ms[bit] / 1000 * _share(blob, force))
                     same = v.plan_same(patch, base, 300, run_limit=run_limit, qshare=blob.get("qshare"),
-                                       test_seconds=sel.ms[bit] / 1000, only=only)
+                                       test_seconds=sel.ms[bit] / 1000, only=only,
+                                       collect=max(0, int(os.environ.get("COLLECT", "6")) - n_forced), force=force)
+                    if force is not None:
+                        v.plan_at = f"{v.plan_at} (forced {n_forced})"
                 else:
                     v.plan_at = "import"
                     same = False

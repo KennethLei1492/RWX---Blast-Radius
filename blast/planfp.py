@@ -254,7 +254,7 @@ def _lazy_heavy():
 
 
 def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshare=None,
-          test_seconds=0.0, edited=None, only=None):
+          test_seconds=0.0, edited=None, only=None, force=None):
     """Runs in a forked child with nothing of sqlglot imported yet. Without a baseline:
     {"setup": hex, "plans": [hex or "-" per query], "sql": [hex or "-" per query]}.
     With one: {"same": bool, "at": where it first differs}.
@@ -276,7 +276,11 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
     in one process; edits to lines that only run after other queries are never gated), the
     caller has established that the imports leave the pinned state, and their text is the
     pinned text; so they reach the executor exactly as on the pinned commit. Their pinned
-    fingerprints stand."""
+    fingerprints stand.
+
+    With `force` (a bitmask), those queries are run for real as well, whatever their plans:
+    on the pinned commit their execution ran an edited statement (and no other query's did),
+    so the edited code is expected to run while they execute."""
     import pickle
 
     from . import verify
@@ -378,7 +382,8 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
             return {"same": False, "at": f"sql {i}"}
     if baseline is None:
         return {"setup": setup, "plans": plans, "sql": out_sql}
-    if not differ:
+    forced = {i for i in range(len(sqls)) if force and force >> i & 1}
+    if not differ and not forced:
         return {"same": True, "at": None}
 
     # Run the differing queries as the test does: their plans on the real fixture tables,
@@ -403,7 +408,8 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
 
     py.PythonExecutor.execute = watched
     tc = cls("test_execute_tpcds")
-    for i in sorted(differ):
+    differ = sorted(set(differ) | forced)
+    for i in differ:
         meta, sql, _ = cls.tpcds_sqls[i]
         try:
             expression = te.parse_one(sql)
@@ -413,6 +419,8 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
                 tc.subtestHelper(i, table, tpch=False)
         except BaseException:  # noqa: BLE001  -- the test fails
             return {"same": False, "at": i, "ran": sorted(differ)}
-        if hits:
+        if i in forced:
+            hits.clear()   # expected: the pinned execution of this query ran the edited code too
+        elif hits:
             return {"same": False, "at": f"edited code ran while executing query {i}"}
     return {"same": True, "at": None, "ran": sorted(differ)}

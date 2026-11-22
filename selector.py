@@ -64,6 +64,10 @@ def spend(key, since):
 
 
 PLAN_MIN_MS = 12000   # probe only when dropping test_execute_tpcds saves at least this much
+# Queries whose plans differ are run for real, up to this share of the saving (estimated from
+# each query's share of the test's execution time) and this many queries.
+PLAN_RUN_FRAC = float(os.environ.get("BLAST_PLAN_RUN_FRAC", "0.4"))
+PLAN_COLLECT = int(os.environ.get("BLAST_PLAN_COLLECT", "6"))
 
 
 def plan_check_commits(sel, tests, ms, patches, static):
@@ -104,15 +108,24 @@ def plan_check_commits(sel, tests, ms, patches, static):
             # import-state difference, checked key by key against what the execution part reads.
             try:
                 if "xattrs" in blob and sel.import_only(patches[cid], bit):
-                    todo.append((saving, cid, ("keys", frozenset()), None))
+                    todo.append((saving, cid, ("keys", frozenset()), None, None))
             except Exception:
                 pass
             continue
         lines = blob["lines"]
+        force = None
         if any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
-            continue   # an edited function runs while plans are executed
+            # an edited function runs while plans are executed: only the queries whose execution
+            # ran an edited statement on the pinned commit need running, if they are few and cheap
+            force = queries_executing(blob, sel.body_spans)
+            if force is None:
+                continue
+            cost = sum((blob.get("qshare") or [1.0] * 99)[i] for i in range(force.bit_length()) if force >> i & 1)
+            if bin(force).count("1") > PLAN_COLLECT or \
+                    cost * ms[num] / 1000 > max(0.0, PLAN_RUN_FRAC * saving / 1000 - 2.0):
+                continue
         todo.append((saving, cid, (sel.body_at_import, frozenset(sel.body_expected)),
-                     queries_reaching(blob, sel.body_spans)))
+                     queries_reaching(blob, sel.body_spans), force))
     if not todo:
         return {}
     v = Verifier()
@@ -149,6 +162,29 @@ def read_in_execution(blob, keys):
     return None
 
 
+def queries_executing(blob, bodies):
+    """Bitmask of the TPC-DS queries whose execution ran an edited statement on the pinned
+    commit (maps/tpcds.bin "xlines", all queries in order in one process); None when an edited
+    statement runs in the class set-up or on an execution line no single query is credited
+    with, or that is not known."""
+    xl, xs = blob.get("xlines"), blob.get("xsetup")
+    if xl is None or xs is None or bodies is None:
+        return None
+    lines = blob["lines"]
+    mask = 0
+    for f, ss in bodies.items():
+        inside = lambda ln: any(a <= ln <= b for a, b in ss)  # noqa: E731
+        if any(inside(ln) for ln in xs.get(f, ())):
+            return None
+        d = xl.get(f, {})
+        if any(inside(ln) and ln not in d for ln in lines.get(f, ())):
+            return None
+        for ln, m in d.items():
+            if inside(ln):
+                mask |= m
+    return mask
+
+
 def queries_reaching(blob, bodies):
     """Bitmask of the TPC-DS queries whose planning ran an edited statement on the pinned
     commit (maps/tpcds.bin "qlines": each query alone, and all in order in one process); None
@@ -177,7 +213,7 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
     import resource
     import zlib
 
-    for saving, cid, at_import, only in sorted(todo, key=lambda t: t[:2], reverse=True):
+    for saving, cid, at_import, only, force in sorted(todo, key=lambda t: t[:2], reverse=True):
         if time.monotonic() - start > allowed or wall_left() < 45:
             print(f"{cid}: no time left for the planning check", file=sys.stderr)
             continue
@@ -220,10 +256,14 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
         # the saving for planning, plus up to 0.4 x the saving (less the cost of loading the
         # tables) for running the few queries whose plans changed.
         saving_s = saving / 1000
-        run_limit = max(0.0, 0.4 * saving_s - 2.0)
+        run_limit = max(0.0, PLAN_RUN_FRAC * saving_s - 2.0)
+        n_forced = bin(force).count("1") if force else 0
+        if force:   # the forced queries' share of the budget is spent already
+            qs = blob.get("qshare") or [1.0] * 99
+            run_limit = max(0.0, run_limit - ms[num] / 1000 * sum(qs[i] for i in range(force.bit_length()) if force >> i & 1))
         same = v.plan_same(patches[cid], blob["base"], timeout=min(60.0, saving_s + 2 * run_limit),
                            run_limit=run_limit, qshare=blob.get("qshare"), test_seconds=ms[num] / 1000,
-                           only=only)
+                           only=only, collect=max(0, PLAN_COLLECT - n_forced), force=force)
         c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu = c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime
         planned = "all" if only is None else bin(only).count("1")

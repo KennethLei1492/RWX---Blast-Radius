@@ -539,6 +539,19 @@ def merge(out, trace, fps):
         if len(qtext) != len(runs[0]["plans"]):
             sys.exit("query count of the fixture does not match the fingerprints")
         blob["base"] = dict(runs[0], qtext=qtext)
+    qexec = os.environ.get("QEXEC")
+    if qexec:   # per-query execution lines (run_qexec): {file: {line: bitmask}}, set-up lines
+        x = json.load(open(qexec))
+        if len(x["queries"]) != len(runs[0]["plans"]):
+            sys.exit("query count of the execution trace does not match the fingerprints")
+        xlines = {}
+        for i, files in enumerate(x["queries"]):
+            for f, ls in files.items():
+                d = xlines.setdefault(f, {})
+                for ln in ls:
+                    d[ln] = d.get(ln, 0) | (1 << i)
+        blob["xlines"] = xlines
+        blob["xsetup"] = {f: frozenset(ls) for f, ls in x["setup"].items()}
     xattr = os.environ.get("XATTR")
     if xattr:   # class attributes and names the set-up and execution part read (run_xattr)
         x = json.load(open(xattr))

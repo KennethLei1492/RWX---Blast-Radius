@@ -125,7 +125,7 @@ class Verifier:
         return got["diff"]
 
     def plan_same(self, patch_text: str, baseline: dict, timeout: float = 60, run_limit: float = 0.0,
-                  qshare=None, test_seconds: float = 0.0, collect: int = 6, only=None):
+                  qshare=None, test_seconds: float = 0.0, collect: int = 6, only=None, force=None):
         """True when test_execute_tpcds cannot change its outcome on the patched tree: everything
         it hands to the Python executor equals the pinned fingerprints, or the few queries whose
         plans differ (running them estimated at most `run_limit` seconds) pass when run
@@ -149,7 +149,7 @@ class Verifier:
                                               collect=collect if run_limit > 0 else 0,
                                               run_limit=run_limit, qshare=qshare,
                                               test_seconds=test_seconds, edited=edited,
-                                              only=only), timeout)
+                                              only=only, force=force), timeout)
         if not isinstance(got, dict) or "same" not in got:
             return None
         self.plan_at = got.get("at")
