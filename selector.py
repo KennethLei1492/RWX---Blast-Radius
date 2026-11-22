@@ -150,20 +150,27 @@ def plan_check_commits(sel, tests, ms, patches, static):
     results = {}
     imstate = None
     try:
-        return _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static)
+        return _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static, sel)
     finally:
         spend("plan", start)
 
 
-def read_in_execution(blob, keys):
+def read_in_execution(blob, keys, sel=None):
     """The first import-state key that the TPC-DS test's class set-up or execution part may
     read (maps/tpcds.bin: the class attributes recorded there, and every name loaded on the
-    lines they run), or None. A key that cannot be judged counts as read."""
+    lines they run), or None. A key that cannot be judged counts as read. A symbol the patch
+    adds whose name occurs nowhere in the pinned tree cannot be read by the pinned execution."""
     xa, xn = blob.get("xattrs"), blob.get("xnames")
     if xa is None or xn is None:
         return keys[0] if keys else None
     for k in keys:
-        if k.startswith("+") or k == "<modules>" or k.endswith(".<bases>"):
+        if k == "<modules>" or k.endswith(".<bases>"):
+            return k
+        if k.startswith("+"):
+            sym = k[1:].partition(":")[2]
+            nm = sym.rsplit(".", 1)[-1] if sym else ""
+            if nm and sel is not None and sel._name_absent_from_pinned(nm):
+                continue
             return k
         mod, _, rest = k.partition(":")
         if "." in rest:
@@ -221,7 +228,7 @@ def queries_reaching(blob, bodies):
     return mask
 
 
-def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static):
+def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static, sel):
     import marshal
     import resource
     import zlib
@@ -242,7 +249,7 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
                 except OSError:
                     imstate = False
             diff = v.import_diff(patches[cid], imstate, timeout=20) if imstate else None
-            hit = "unknown" if diff is None else read_in_execution(blob, [k for k in diff if k not in expected])
+            hit = "unknown" if diff is None else read_in_execution(blob, [k for k in diff if k not in expected], sel)
             if hit is not None:
                 print(f"{cid}: planning check not possible, the execution part may read {hit}; kept",
                       file=sys.stderr)

@@ -237,6 +237,54 @@ class Selector:
             b |= ti.get(x, 0)
         return b
 
+    def _name_absent_from_pinned(self, name):
+        """True when identifier `name` occurs nowhere in the pinned sqlglot/ and tests/ source.
+        Then no pinned code or test can reference it (by attribute access or by name for
+        getattr/hasattr), so a symbol the patch adds under that name is invisible to every
+        pinned test. Conservative: any read error or odd name returns False (not absent)."""
+        if not name or not name.isidentifier():
+            return False
+        cache = self.__dict__.setdefault("_absent", {})
+        if name in cache:
+            return cache[name]
+        root = self.root
+        if not root or not os.path.isdir(root):
+            cache[name] = False
+            return False
+        import subprocess
+
+        found = True
+        try:
+            # whole-word search; return code 1 means "no match" i.e. absent
+            r = subprocess.run(["grep", "-rwqF", "--include=*.py", name,
+                                os.path.join(root, "sqlglot"), os.path.join(root, "tests")],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+            found = (r.returncode == 0)
+        except Exception:  # noqa: BLE001  -- cannot be sure: treat as present
+            found = True
+        cache[name] = not found
+        return cache[name]
+
+    def _id_index(self):
+        idx = getattr(self, "_idx", None)
+        if idx is None:
+            idx = self._idx = {t: i for i, t in enumerate(self.m["ids"])}
+        return idx
+
+    def _only_new_test_methods(self, mod, qualname, names):
+        """True when every `name` added to class `qualname` of test module `mod` is a new
+        `test_*` method (name starts with "test", and that test id is not in the map, so it did
+        not exist on the pinned commit). A new method cannot shadow a fixture or an existing
+        test, and a brand-new test is not in tests.json, so it is never scored."""
+        path = mod.replace(".", "/") + ".py"
+        idx = self._id_index()
+        for n in names:
+            if not n.startswith("test"):
+                return False   # setUp/tearDown/helpers can change siblings
+            if f"{path}::{qualname}::{n}" in idx:
+                return False   # an existing test of that name: it is being modified, not added
+        return True
+
     def class_users(self, mod, qualname, names, seen, existing=False):
         key = ("class", mod, qualname, tuple(names) if names else None)
         if key in seen:
@@ -444,6 +492,11 @@ class Selector:
             self.uncertain = True
         if kind == "class":
             mod, qualname, names = imp[1], imp[2], imp[3]
+            if len(imp) == 5 and mod.startswith("tests.") and qualname and names and \
+                    self._only_new_test_methods(mod, qualname, names):
+                # new test methods added to a test class: a new test is not in tests.json so it
+                # is never scored, and adding a method cannot change a sibling test's outcome
+                return 0
             # a statement added to a class (5th element "new") may shadow a base attribute:
             # only an existing assignment has an exact reader set
             b = self.class_users(mod, qualname, names, seen, existing=len(imp) == 4)
@@ -537,7 +590,25 @@ class Selector:
             a = self._attr_map()
             km = self.key_map() if entry else None
             for k in keys:
-                if k.startswith("+") or k == "<modules>" or k.endswith(".<bases>"):
+                if k == "<modules>" or k.endswith(".<bases>"):
+                    return None
+                if k.startswith("+"):
+                    # a symbol the patched import added. A pinned test can only observe it by
+                    # naming it (an attribute access or a string for getattr) or by iterating its
+                    # class dict. When the name occurs nowhere in the pinned tree and no test
+                    # reads that class's dict as a whole, no pinned test's outcome depends on it,
+                    # so it contributes no readers; anything derived from it that existing code
+                    # reads shows up as a separate, non-added changed key handled below.
+                    mod, _, sym = k[1:].partition(":")   # "module" : "Class.attr" or "name"
+                    if not sym:
+                        return None
+                    nm = sym.rsplit(".", 1)[-1]          # the added identifier
+                    clspath = sym.rsplit(".", 1)[0] if "." in sym else None
+                    owner = f"{mod}:{clspath}" if clspath else None
+                    a2 = self._attr_map() if owner else None
+                    wild = bool(a2 and (a2["reads"].get(owner, {}).get("*") or "*" in a2["imp"].get(owner, ())))
+                    if not wild and self._name_absent_from_pinned(nm):
+                        continue   # a brand-new symbol no pinned test can name or observe
                     return None
                 e = entry.get(k) if entry else None
                 t = km["tables"].get(k) if (km and e is not None) else None

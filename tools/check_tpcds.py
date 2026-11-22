@@ -85,7 +85,7 @@ def main():
             if spans is None and "xattrs" in blob and sel.import_only(patch, bit):
                 r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 diff = v.import_diff(patch, imstate, 60)
-                hit = "unknown" if diff is None else read_in_execution(blob, diff)
+                hit = "unknown" if diff is None else read_in_execution(blob, diff, sel)
                 same = None
                 if hit is None:
                     saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
@@ -117,7 +117,7 @@ def main():
                 if idiff is not None:
                     idiff = [k for k in idiff if k not in expected]
                 if mixed:
-                    ok = idiff is not None and read_in_execution(blob, idiff) is None
+                    ok = idiff is not None and read_in_execution(blob, idiff, sel) is None
                 else:
                     ok = not at_import or idiff == []
                 if ok:
