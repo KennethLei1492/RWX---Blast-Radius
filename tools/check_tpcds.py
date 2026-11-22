@@ -20,6 +20,7 @@ os.environ.setdefault("SKIP_INTEGRATION", "0")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 from blast import planfp, verify  # noqa: E402
 from blast.select import Selector  # noqa: E402
+from selector import queries_reaching  # noqa: E402
 
 
 def main():
@@ -55,6 +56,7 @@ def main():
             fails = bit in d["failing"]
             spans = sel.body_lines(patch, bit)
             at_import = sel.body_at_import
+            only = queries_reaching(blob, sel.body_spans) if os.environ.get("NO_GATE") is None else None
             if spans is None:
                 what = "kept, not eligible"
             elif any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
@@ -68,7 +70,7 @@ def main():
                     saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
                     run_limit = max(0.0, 0.4 * saving_s - 2.0)
                     same = v.plan_same(patch, base, 300, run_limit=run_limit, qshare=blob.get("qshare"),
-                                       test_seconds=sel.ms[bit] / 1000)
+                                       test_seconds=sel.ms[bit] / 1000, only=only)
                 else:
                     v.plan_at = "import"
                     same = False
@@ -77,8 +79,9 @@ def main():
                 cpu += c
                 what = "dropped" if same else ("kept, unknown" if same is None else "kept, differs")
                 what_at = getattr(v, "plan_at", None)
-                print(f"   {cid}: probe {c:.1f}s cpu, first difference {what_at}, ran {getattr(v, 'plan_ran', None)}",
-                      flush=True)
+                planned = "all" if only is None else bin(only).count("1")
+                print(f"   {cid}: probe {c:.1f}s cpu, {planned} planned, first difference {what_at}, "
+                      f"ran {getattr(v, 'plan_ran', None)}", flush=True)
             stats[what] += 1
             if what == "dropped" and fails:
                 miss += 1

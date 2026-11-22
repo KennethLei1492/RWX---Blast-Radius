@@ -125,11 +125,12 @@ class Verifier:
         return got["diff"]
 
     def plan_same(self, patch_text: str, baseline: dict, timeout: float = 60, run_limit: float = 0.0,
-                  qshare=None, test_seconds: float = 0.0, collect: int = 6):
+                  qshare=None, test_seconds: float = 0.0, collect: int = 6, only=None):
         """True when test_execute_tpcds cannot change its outcome on the patched tree: everything
         it hands to the Python executor equals the pinned fingerprints, or the few queries whose
         plans differ (running them estimated at most `run_limit` seconds) pass when run
-        (blast/planfp.py); False when it may fail; None if that cannot be established."""
+        (blast/planfp.py); False when it may fail; None if that cannot be established. With
+        `only` (a bitmask), the other queries keep their pinned fingerprints unplanned."""
         self.plan_at = self.plan_ran = None
         if not self.start():
             return None
@@ -147,7 +148,8 @@ class Verifier:
         got = self._fork(lambda: planfp.probe(self.root, files, maps, baseline,
                                               collect=collect if run_limit > 0 else 0,
                                               run_limit=run_limit, qshare=qshare,
-                                              test_seconds=test_seconds, edited=edited), timeout)
+                                              test_seconds=test_seconds, edited=edited,
+                                              only=only), timeout)
         if not isinstance(got, dict) or "same" not in got:
             return None
         self.plan_at = got.get("at")

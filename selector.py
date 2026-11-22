@@ -103,11 +103,11 @@ def plan_check_commits(sel, tests, ms, patches, static):
         lines = blob["lines"]
         if any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
             continue   # an edited function runs while plans are executed
-        todo.append((saving, cid, sel.body_at_import))
+        todo.append((saving, cid, sel.body_at_import, queries_reaching(blob, sel.body_spans)))
     if not todo:
         return {}
     v = Verifier()
-    if not v.start(heavy=len(todo) >= 2):
+    if not v.start(heavy=False):   # the probe stands in for duckdb/numpy/pandas (planfp._lazy_heavy)
         return {}
 
     start = time.monotonic()
@@ -120,12 +120,35 @@ def plan_check_commits(sel, tests, ms, patches, static):
         spend("plan", start)
 
 
+def queries_reaching(blob, bodies):
+    """Bitmask of the TPC-DS queries whose planning ran an edited statement on the pinned
+    commit (maps/tpcds.bin "qlines": each query alone, and all in order in one process); None
+    when that is not known, or when an edited statement is one some query runs only after
+    others ran before it ("qwarm"), so which queries reach it depends on the order."""
+    ql = blob.get("qlines")
+    warm = blob.get("qwarm")
+    if ql is None or warm is None or bodies is None:
+        return None
+    mask = 0
+    for f, ss in bodies.items():
+        w = warm.get(f, ())
+        if any(a <= ln <= b for ln in w for a, b in ss):
+            return None
+        d = ql.get(f)
+        if not d:
+            continue
+        for ln, m in d.items():
+            if any(a <= ln <= b for a, b in ss):
+                mask |= m
+    return mask
+
+
 def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static):
     import marshal
     import resource
     import zlib
 
-    for saving, cid, at_import in sorted(todo, reverse=True):
+    for saving, cid, at_import, only in sorted(todo, key=lambda t: t[:2], reverse=True):
         if time.monotonic() - start > allowed or wall_left() < 45:
             print(f"{cid}: no time left for the planning check", file=sys.stderr)
             continue
@@ -150,16 +173,18 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
         saving_s = saving / 1000
         run_limit = max(0.0, 0.4 * saving_s - 2.0)
         same = v.plan_same(patches[cid], blob["base"], timeout=min(60.0, saving_s + 2 * run_limit),
-                           run_limit=run_limit, qshare=blob.get("qshare"), test_seconds=ms[num] / 1000)
+                           run_limit=run_limit, qshare=blob.get("qshare"), test_seconds=ms[num] / 1000,
+                           only=only)
         c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu = c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime
+        planned = "all" if only is None else bin(only).count("1")
         if same:
-            how = f"queries {v.plan_ran} pass when run" if v.plan_ran else "plans unchanged"
+            how = f"queries {v.plan_ran} pass when run" if v.plan_ran else f"plans unchanged ({planned} planned)"
             print(f"{cid}: planning check {cpu:.3f}s cpu: {how}, dropping test_execute_tpcds "
                   f"(saves {saving / 1000:.1f}s)", file=sys.stderr)
             results[cid] = static[cid] - {num}
         else:
-            print(f"{cid}: planning check {cpu:.3f}s cpu: "
+            print(f"{cid}: planning check {cpu:.3f}s cpu ({planned} planned): "
                   f"{'inconclusive' if same is None else 'differs at ' + str(v.plan_at)}; kept", file=sys.stderr)
     return results
 
@@ -273,13 +298,15 @@ def _isd_loop(todo, start, allowed, v, base, tables, sel, patches, static, ms, t
     for cid in sorted(todo, key=lambda c: -cost_ms(static[c], ms)):
         if time.monotonic() - start > allowed or wall_left() < 70:
             break
+        c0 = _children_cpu()
         diff = v.import_diff(patches[cid], base, timeout=20, tables=tables)
+        cpu = _children_cpu() - c0
         if diff is None:
-            print(f"{cid}: import diff unavailable", file=sys.stderr)
+            print(f"{cid}: import diff unavailable ({cpu:.3f}s cpu)", file=sys.stderr)
             continue
         bits = sel.select_alt(patches[cid], diff, v.entry)
         if bits is None:
-            print(f"{cid}: import diff has keys without readers ({len(diff)}); kept", file=sys.stderr)
+            print(f"{cid}: import diff has keys without readers ({len(diff)}, {cpu:.3f}s cpu); kept", file=sys.stderr)
             continue
         alt = set()
         while bits:
@@ -291,8 +318,18 @@ def _isd_loop(todo, start, allowed, v, base, tables, sel, patches, static, ms, t
         # tests this build knows nothing about stay in, as they were
         alt |= {t for t in static[cid] if t not in KNOWN}
         if cost_ms(alt, ms) < cost_ms(static[cid], ms):
-            print(f"{cid}: import diff ({len(diff)} keys): {len(static[cid])} -> {len(alt)} tests", file=sys.stderr)
+            print(f"{cid}: import diff ({len(diff)} keys, {cpu:.3f}s cpu): {len(static[cid])} -> {len(alt)} tests",
+                  file=sys.stderr)
             results[cid] = alt
+        else:
+            print(f"{cid}: import diff ({len(diff)} keys, {cpu:.3f}s cpu): no cheaper selection", file=sys.stderr)
+
+
+def _children_cpu():
+    import resource
+
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return r.ru_utime + r.ru_stime
 
 
 KNOWN: set = set()

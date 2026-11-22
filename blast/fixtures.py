@@ -63,6 +63,24 @@ def _module_facts(root, test_file):
     return _cache[key]
 
 
+_texts = {}
+
+
+def _may_load(root, test_file, rel):
+    """Cheap test before parsing a test module: a set-up load of the fixture spells its path
+    (relative to tests/fixtures) literally in a `setUpClass`. Parsing every opener's module
+    costs more than the rest of a commit's selection."""
+    key = (root, test_file)
+    if key not in _texts:
+        try:
+            with open(os.path.join(root, test_file), encoding="utf-8") as fh:
+                _texts[key] = fh.read()
+        except (OSError, ValueError):
+            _texts[key] = ""
+    text = _texts[key]
+    return "setUpClass" in text and rel in text
+
+
 def _mentions(tree, text):
     """How many string constants in the module contain `text`."""
     return sum(1 for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
@@ -146,7 +164,10 @@ def setup_only_readers(sel, fixture, new_text, openers_bits):
             f, _, rest = ids[i].partition("::")
             by_file.setdefault(f, []).append((i, rest.split("::")[0]))
     drop = 0
+    rel = fixture[len("tests/fixtures/"):] if fixture.startswith("tests/fixtures/") else None
     for test_file, members in by_file.items():
+        if rel is None or not _may_load(root, test_file, rel):
+            continue
         loads, tree = _module_facts(root, test_file)
         if tree is None:
             continue
@@ -158,7 +179,6 @@ def setup_only_readers(sel, fixture, new_text, openers_bits):
             lines = _attr_load_lines(tree, attr)
             if lines is None:
                 continue
-            rel = fixture[len("tests/fixtures/"):]
             if not _loads_ok(root, loader, rel, new_text):
                 continue
             traced = _traced_readers(sel, test_file, cls_name, attr)

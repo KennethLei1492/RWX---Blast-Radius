@@ -593,9 +593,13 @@ class Selector:
         With `bit` (a test's index), files whose own selection does not hold that test are
         left out: by the ordinary rules they cannot affect it."""
         self.body_at_import = False
+        self.body_spans = None
         if "\r\n" in patch_text:
             patch_text = patch_text.replace("\r\n", "\n")
         out = {}
+        # pinned lines that run exactly when an edited statement does: the edited statements'
+        # regions, and for a changed parameter default the function's body without its header
+        bodies = {}
         for fp in diffparse.parse(patch_text):
             if bit is not None:
                 was = self.uncertain
@@ -638,6 +642,7 @@ class Selector:
                     if not equiv.only_defaults_differ(was[node[1] - 1:node[2]], applied.new_lines[ns - 1:ne]):
                         return None
                     out.setdefault(path, set()).add((node[1], node[2]))
+                    bodies.setdefault(path, set()).add((node[3] + 1, node[2]))
                     continue
                 if imp[0] != "lines":
                     return None
@@ -650,6 +655,9 @@ class Selector:
                     if any(v.import_line(x) for x in range(node[3] + 1, node[2] + 1)):
                         self.body_at_import = True
                     out.setdefault(path, set()).add((node[1], node[2]))
+                    # the statement's own lines (its region, as coverage selects tests by)
+                    bodies.setdefault(path, set()).add((l, l))
+        self.body_spans = {k: sorted(v) for k, v in bodies.items()}
         return {k: sorted(v) for k, v in out.items()}
 
     def openers(self, path):

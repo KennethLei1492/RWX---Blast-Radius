@@ -180,6 +180,11 @@ def _rows_fp(rows):
     return hashlib.blake2b(repr(rows).encode("utf-8", "surrogatepass"), digest_size=8).digest()
 
 
+def text_hash(text):
+    """A query's text as stored in maps/tpcds.bin ("qtext")."""
+    return hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
+
+
 def _watch_edited(edited):
     """Start watching for edited code: {file: set of new line numbers}. Returns (hits, on, off):
     while on, the qualified name of every code object that starts and holds an edited line is
@@ -203,8 +208,53 @@ def _watch_edited(edited):
     return hits, (lambda: mon.set_events(tool, mon.events.PY_START)), (lambda: mon.set_events(tool, 0))
 
 
+_HEAVY = ("duckdb", "numpy", "pandas", "pandas.testing")
+
+
+def _lazy_heavy():
+    """tests/test_executor.py imports duckdb, numpy and pandas at module level (about two
+    seconds of CPU), but planning never touches them: only loading the fixture tables and
+    comparing results with DuckDB's do. Stand-ins take their place while the test module is
+    imported; any later attribute read swaps in the real modules (all of them at once, so that
+    pandas finds the real numpy). Returns a function that ends the import phase, or None when
+    the real modules are already loaded."""
+    import importlib
+    import types
+
+    if any(m in sys.modules for m in _HEAVY):
+        return None
+    importing = [True]
+    stubs = {}
+
+    def real(name):
+        for m in _HEAVY:
+            if m in stubs and sys.modules.get(m) is stubs[m]:
+                del sys.modules[m]
+        return importlib.import_module(name)
+
+    class Lazy(types.ModuleType):
+        def __getattr__(self, attr):
+            if attr.startswith("__"):
+                raise AttributeError(attr)
+            name = self.__name__
+            if importing[0]:
+                # `from pandas.testing import assert_frame_equal` while the module loads
+                def call(*a, **k):
+                    return getattr(real(name), attr)(*a, **k)
+                return call
+            return getattr(real(name), attr)
+
+    for m in _HEAVY:
+        stubs[m] = sys.modules[m] = Lazy(m)
+    stubs["pandas"].__dict__["testing"] = stubs["pandas.testing"]
+
+    def done():
+        importing[0] = False
+    return done
+
+
 def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshare=None,
-          test_seconds=0.0, edited=None):
+          test_seconds=0.0, edited=None, only=None):
     """Runs in a forked child with nothing of sqlglot imported yet. Without a baseline:
     {"setup": hex, "plans": [hex or "-" per query], "sql": [hex or "-" per query]}.
     With one: {"same": bool, "at": where it first differs}.
@@ -217,7 +267,16 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
     cache keyed by class), so it passes as it does on the pinned commit; the test then passes
     exactly when the differing queries do. Should an edited function (`edited`: {file: new
     line numbers}) start while those queries execute, the answer is "differs": that code never
-    ran in the pinned execution part, so nothing is known about what it leaves behind."""
+    ran in the pinned execution part, so nothing is known about what it leaves behind.
+
+    With `only` (a bitmask of queries, from the per-query planning lines of maps/tpcds.bin),
+    the other queries are not planned: on the pinned commit no edited statement ran while any
+    of them was parsed, planned or transpiled (each traced alone in a fresh process after the
+    imports, so lazily built state is credited to every query that needs it, and all in order
+    in one process; edits to lines that only run after other queries are never gated), the
+    caller has established that the imports leave the pinned state, and their text is the
+    pinned text; so they reach the executor exactly as on the pinned commit. Their pinned
+    fingerprints stand."""
     import pickle
 
     from . import verify
@@ -228,7 +287,10 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
     sys.stdout = open(os.devnull, "w")
     sys.stderr = sys.stdout
     verify._install_overlay(root, files)
+    done = _lazy_heavy()
     import tests.test_executor as te
+    if done is not None:
+        done()
     from sqlglot.executor import env as executor_env
     from sqlglot.executor import python as py
     from sqlglot.executor.table import Table
@@ -266,6 +328,12 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
     if want is not None and len(want) != len(sqls):
         return {"same": False, "at": "count"}
     budget = {"cost": 0.0}
+    qtext = baseline.get("qtext") if baseline is not None else None
+    if only is not None and (want is None or qtext is None or len(qtext) != len(sqls)):
+        only = None
+    skip = set()
+    if only is not None:
+        skip = {i for i, (_, sql, _) in enumerate(sqls) if not only >> i & 1 and text_hash(sql) == qtext[i]}
 
     def too_many(i, cur):
         """Record query i as differing; True when running the differing ones is out of reach."""
@@ -277,6 +345,9 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
         return budget["cost"] > run_limit
 
     for i, (meta, sql, _) in enumerate(sqls):
+        if i in skip:
+            plans.append(want[i])
+            continue
         n = len(got)
         try:
             expression = te.parse_one(sql)
@@ -291,6 +362,9 @@ def probe(root, files, line_maps, baseline=None, collect=0, run_limit=0.0, qshar
     out_sql = []
     wsql = baseline["sql"] if baseline is not None else None
     for i, (meta, sql, _) in enumerate(sqls):
+        if i in skip:
+            out_sql.append(wsql[i])
+            continue
         if plans[i] == "-":
             cur = "-"
         else:

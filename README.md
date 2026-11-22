@@ -159,9 +159,34 @@ time dropping the test would save. If an edited function also runs while modules
 imported, the import diff above must first show that the import leaves exactly the pinned
 state. Other files in the same patch (a fixture, a docstring, another test file) are left out
 of this when their own selection does not hold the test; the probe still runs on the whole
-patch. Checked with `tools/check_tpcds.py` on 115 labeled commits that select the test: it
-was dropped in 41, none of which fails it (5 of them by running 1 to 6 differing queries),
-and kept in all 48 where it fails.
+patch. Checked with `tools/check_tpcds.py` on 212 labeled commits that select the test
+(code mutations, class and module table edits, TPC-DS query file edits): it was dropped in
+49, none of which fails it (6 of them by running 1 to 6 differing queries), and kept in all
+64 where it fails.
+
+**Only the queries an edit reaches (`maps/tpcds.bin` "qlines", `selector.queries_reaching`).**
+Planning the queries is nearly all of the probe (sqlglot's optimizer about half, the
+fingerprints a fifth), yet an edited statement is often run by only some of them, and an edit
+to the query file changes only a few. `tools/build_tpcds.py qcov` records, for
+each query alone in a fresh process after the imports, the lines of the pinned tree that run
+while it is parsed, passed through pickle, optimized, planned up to the executor and
+transpiled for DuckDB; `qseq` records the same with all queries in one process, in order, as
+the test runs them. A query that ran none of the edited statements in either trace (the same
+statement regions the test selection matches against coverage; for a changed parameter
+default, the function's body) is not planned: with the import state established as pinned
+and its text unchanged, it reaches the executor as on the pinned commit, so its pinned
+fingerprints stand. Lines some query runs only after other queries ran before it (a cache
+hit, say) switch this off, since which queries reach them depends on the order (only 11
+lines, all in the test module, are like that). A TPC-DS query whose text an edit changes is
+always planned. On the labeled commits above, 15 probes plan no query at all and 10 more
+plan fewer than 20; on the TPC-DS query-file set the selector's CPU fell from 73 s to 13 s and its
+simulated time from 335 s to 250 s, as probes that used to run out of time now finish. The
+probe also leaves duckdb, numpy and
+pandas unloaded unless it runs differing queries: the test module imports them at module
+level, but planning never uses them, so stand-ins take their place while it loads and the
+first real use swaps in the real modules (`planfp._lazy_heavy`). That saves about two seconds
+of CPU per run of the check, which the selector used to pay up front to share them with its
+children.
 
 **Children start after `import sqlglot` (`selector.run_stages`, `verify.preload_core`).** Every
 child that imports the patched tree (an import diff, a planning check, a test run) starts with
