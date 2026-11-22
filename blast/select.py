@@ -843,7 +843,13 @@ class Selector:
                     ns, ne = applied.new_range(node[1], node[2])
                     was = applied.old_lines if applied.old_lines is not None else old_src.split("\n")
                     if not equiv.only_defaults_differ(was[node[1] - 1:node[2]], applied.new_lines[ns - 1:ne]):
-                        return None
+                        # not purely a default value: the header or signature changed too. It runs
+                        # when the module is imported, so the function's own fingerprint will differ
+                        # by design; mark it expected and let the planning check verify the plans and
+                        # run any query that reaches the function (it cannot miss -- it runs them).
+                        self.body_at_import = True
+                        if len(imp) > 3 and imp[3]:
+                            self.body_expected.add(f"{pyimpact.module_name(path)}:{imp[3]}")
                     out.setdefault(path, set()).add((node[1], node[2]))
                     bodies.setdefault(path, set()).add((node[3] + 1, node[2]))
                     continue
@@ -862,7 +868,17 @@ class Selector:
                             continue
                         return None
                     if l <= node[3]:
-                        return None
+                        # an edit to the def header, a decorator or the signature: it runs when the
+                        # module is imported and changes the whole function, so the function's own
+                        # fingerprint differs by design. Mark it expected and take the function's
+                        # full body as the edited region; the planning check then verifies the plans
+                        # and runs any query that reaches the function (it cannot miss).
+                        self.body_at_import = True
+                        if len(imp) > 3 and imp[3]:
+                            self.body_expected.add(f"{pyimpact.module_name(path)}:{imp[3]}")
+                        out.setdefault(path, set()).add((node[1], node[2]))
+                        bodies.setdefault(path, set()).add((node[3] + 1, node[2]))
+                        continue
                     # the header runs when the module is imported; if the body does too, the
                     # caller must also establish that the import leaves the same state
                     if any(v.import_line(x) for x in range(node[3] + 1, node[2] + 1)):
