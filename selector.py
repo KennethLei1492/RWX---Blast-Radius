@@ -381,7 +381,7 @@ def _verify_loop(plans, budget, start, v, patches, id_of, results):
         results[cid] = kept
 
 
-ISD_MIN_MS = 3500   # only commits whose ordinary selection costs at least this much
+ISD_MIN_MS = 2300   # only commits whose ordinary selection costs at least this much
 ISD_TABLE_MIN_MS = 2000   # a class or module table edit: its entries usually have few readers
 # An import diff costs about this much CPU (scorer, ms); a selection the verify stage will run
 # for less anyway gets its exact failing tests there, so the import diff is skipped for it.
