@@ -843,7 +843,14 @@ class Selector:
                     return None
                 for l in imp[2]:
                     node = next((n for n in v.chain(l) or () if n[4] == "D"), None)
-                    if node is None or l <= node[3]:
+                    if node is None:
+                        # a comment or blank line carries no statement, so an edit to it runs
+                        # nothing and selects nothing; only a real statement with no enclosing
+                        # function (a class body or module level) forces the import-diff route
+                        if not v.is_code(l):
+                            continue
+                        return None
+                    if l <= node[3]:
                         return None
                     # the header runs when the module is imported; if the body does too, the
                     # caller must also establish that the import leaves the same state
