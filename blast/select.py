@@ -660,7 +660,11 @@ class Selector:
             a = self._attr_map()
             km = self.key_map() if entry else None
             for k in keys:
-                if k == "<modules>" or k.endswith(".<bases>"):
+                # A structural change to an existing symbol (the module set, or a class's bases)
+                # cannot be analysed key by key; the ordinary selection stands. But a brand-new
+                # class the patch adds also gets a "+...<bases>" key, and that one is handled with
+                # the other added keys below, not treated as a structural change here.
+                if not k.startswith("+") and (k == "<modules>" or k.endswith(".<bases>")):
                     return None
                 if k.startswith("+"):
                     # a symbol the patched import added. A pinned test can only observe it by
@@ -672,12 +676,19 @@ class Selector:
                     mod, _, sym = k[1:].partition(":")   # "module" : "Class.attr" or "name"
                     if not sym:
                         return None
+                    # The outermost added name: the class or global itself. When the patch adds a
+                    # whole new class, its bases and each of its attributes arrive as separate
+                    # "+Class.<bases>" / "+Class.attr" keys, all part of that one new symbol, so if
+                    # its name is nowhere in the pinned tree no pinned test can observe any of them.
+                    top = sym.split(".", 1)[0]
+                    if self._name_absent_from_pinned(top):
+                        continue
                     nm = sym.rsplit(".", 1)[-1]          # the added identifier
                     clspath = sym.rsplit(".", 1)[0] if "." in sym else None
                     owner = f"{mod}:{clspath}" if clspath else None
                     a2 = self._attr_map() if owner else None
                     wild = bool(a2 and (a2["reads"].get(owner, {}).get("*") or "*" in a2["imp"].get(owner, ())))
-                    if not wild and self._name_absent_from_pinned(nm):
+                    if not wild and nm.isidentifier() and self._name_absent_from_pinned(nm):
                         continue   # a brand-new symbol no pinned test can name or observe
                     return None
                 e = entry.get(k) if entry else None
