@@ -181,6 +181,22 @@ def _assigned_names(st):
     return names or None
 
 
+def _stores_into_object(st):
+    """True for a statement that assigns to an attribute or an item (`Scope.x = ...`,
+    `TABLE[k] = ...`): it changes an object that other modules may share, not a name here."""
+    if isinstance(st, A.Assign):
+        targets = st.targets
+    elif isinstance(st, (A.AnnAssign, A.AugAssign)):
+        targets = [st.target]
+    else:
+        return False
+    for t in targets:
+        for n in _walk(t):
+            if isinstance(n, (A.Attribute, A.Subscript)):
+                return True
+    return False
+
+
 def _lambdas_holding(st, line, col_span):
     """Innermost lambda (or nested function inside an expression) in `st` holding the change."""
     best = None
@@ -593,6 +609,11 @@ def analyze(path, view, old_src, new_src, applied):
                 except (SyntaxError, ValueError):
                     pieces = None
                     break
+                if wrap and len(tree.body) != 1:
+                    # a new line dedents out of the piece (a statement appended after the
+                    # last block of the file, say): its real nesting is not in the piece
+                    pieces = None
+                    break
                 pieces.append((ns, ne, wrap, tree, outer))
         else:
             pieces = None
@@ -610,31 +631,31 @@ def analyze(path, view, old_src, new_src, applied):
         except (SyntaxError, ValueError):
             return [("broken", mod)]
 
-    def new_statement(newno):
-        """(statement node, its span in new lines, enclosing scope kinds, qualname)."""
+    def new_statements(newno):
+        """The statements of the new file that hold line `newno`, outermost first, each as
+        (statement node, its span in new lines, enclosing scope kinds, qualname)."""
+        found = []
         if full is not None:
             chain = locate(full, newno)
-            if len(chain) <= 1:
-                return None
-            st = chain[-1]
-            span = (_start(st), _end(st))
-            scopes = ["D" if isinstance(n, FUNC) else "C" for n in chain[:-1] if isinstance(n, SCOPE)]
-            return st, span, scopes, _qualname(chain[:-1])
+            for i in range(1, len(chain)):
+                st = chain[i]
+                scopes = ["D" if isinstance(n, FUNC) else "C" for n in chain[:i] if isinstance(n, SCOPE)]
+                found.append((st, (_start(st), _end(st)), scopes, _qualname(chain[:i])))
+            return found
         for ns, ne, wrap, tree, outer in pieces:
             if ns <= newno <= ne:
                 rel = newno - ns + 1 + wrap
                 chain = locate(tree, rel)[1 + wrap:]
-                if not chain:
-                    return None
-                st = chain[-1]
                 off = ns - 1 - wrap
-                span = (_start(st) + off, _end(st) + off)
-                scopes = [n[4] for n in outer if n[4] in ("C", "D")] + [
-                    "D" if isinstance(n, FUNC) else "C" for n in chain[:-1] if isinstance(n, SCOPE)]
-                names = [n[5] for n in outer if n[4] in ("C", "D")] + [
-                    n.name for n in chain[:-1] if isinstance(n, SCOPE)]
-                return st, span, scopes, ".".join(names)
-        return None
+                for i in range(len(chain)):
+                    st = chain[i]
+                    scopes = [n[4] for n in outer if n[4] in ("C", "D")] + [
+                        "D" if isinstance(n, FUNC) else "C" for n in chain[:i] if isinstance(n, SCOPE)]
+                    names = [n[5] for n in outer if n[4] in ("C", "D")] + [
+                        n.name for n in chain[:i] if isinstance(n, SCOPE)]
+                    found.append((st, (_start(st) + off, _end(st) + off), scopes, ".".join(names)))
+                break
+        return found
 
     paired = set(applied.new_changed) if spans else set()
     added_set = set(applied.new_changed)
@@ -646,19 +667,25 @@ def analyze(path, view, old_src, new_src, applied):
         code_change = True
         # A whole new statement at class or module level (a new method, an override, a
         # new attribute) changes the class or the module namespace.
-        found = new_statement(newno)
-        if found is not None:
-            st_new, (s0, s1), scopes, qual = found
-            wholly_new = all(l in added_set or _blank_or_comment(new_lines[l - 1]) for l in range(s0, s1 + 1))
-            if wholly_new and not (scopes and scopes[-1] == "D"):
-                names = _assigned_names(st_new)
+        # The outermost wholly new statement holding the line decides: the body of a new
+        # function or method runs only through the name it adds, not when the old lines
+        # beside it run.
+        placed = False
+        for st_new, (s0, s1), scopes, qual in new_statements(newno):
+            if not all(l in added_set or _blank_or_comment(new_lines[l - 1]) for l in range(s0, s1 + 1)):
+                continue
+            if not (scopes and scopes[-1] == "D"):
+                names = None if _stores_into_object(st_new) else _assigned_names(st_new)
                 if scopes:
                     out.append(("class", mod, qual, names, "new"))
                 elif names is None:
                     out.append(("module", mod))
                 else:
                     out.append(("const", mod, names))
-                continue
+                placed = True
+            break
+        if placed:
+            continue
         # A new line of code between old lines anchor-1 and anchor: it runs when its
         # neighbours run.
         for l in (prev_code(anchor - 1), next_code(anchor)):
