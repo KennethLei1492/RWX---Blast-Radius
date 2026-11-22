@@ -103,15 +103,24 @@ def plan_check_commits(sel, tests, ms, patches, static):
             spans = sel.body_lines(patches[cid], bit)
         except Exception:
             spans = None
+        mixed = False
         if spans is None:
             # Only class-body or module-level statements changed: their whole effect is the
             # import-state difference, checked key by key against what the execution part reads.
             try:
                 if "xattrs" in blob and sel.import_only(patches[cid], bit):
                     todo.append((saving, cid, ("keys", frozenset()), None, None))
+                    continue
             except Exception:
-                pass
-            continue
+                continue
+            # Function bodies and class-body or module-level statements together: both checks.
+            try:
+                spans = sel.body_lines(patches[cid], bit, allow_import=True) if "xattrs" in blob else None
+            except Exception:
+                spans = None
+            if spans is None or not sel.body_import:
+                continue
+            mixed = True
         lines = blob["lines"]
         force = None
         if any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
@@ -124,6 +133,10 @@ def plan_check_commits(sel, tests, ms, patches, static):
             if bin(force).count("1") > PLAN_COLLECT or \
                     cost * ms[num] / 1000 > max(0.0, PLAN_RUN_FRAC * saving / 1000 - 2.0):
                 continue
+        if mixed:
+            # the import-time edits may change what any query's planning sees: plan them all
+            todo.append((saving, cid, ("keys", frozenset(sel.body_expected)), None, force))
+            continue
         todo.append((saving, cid, (sel.body_at_import, frozenset(sel.body_expected)),
                      queries_reaching(blob, sel.body_spans), force))
     if not todo:
@@ -229,7 +242,7 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
                 except OSError:
                     imstate = False
             diff = v.import_diff(patches[cid], imstate, timeout=20) if imstate else None
-            hit = "unknown" if diff is None else read_in_execution(blob, diff)
+            hit = "unknown" if diff is None else read_in_execution(blob, [k for k in diff if k not in expected])
             if hit is not None:
                 print(f"{cid}: planning check not possible, the execution part may read {hit}; kept",
                       file=sys.stderr)

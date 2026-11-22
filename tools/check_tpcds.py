@@ -74,6 +74,14 @@ def main():
             spans = sel.body_lines(patch, bit)
             at_import = sel.body_at_import
             only = queries_reaching(blob, sel.body_spans) if os.environ.get("NO_GATE") is None else None
+            mixed = False
+            if spans is None and "xattrs" in blob and not sel.import_only(patch, bit):
+                # function bodies and class-body or module-level statements together
+                spans = sel.body_lines(patch, bit, allow_import=True)
+                if spans is not None and sel.body_import:
+                    mixed, only = True, None
+                else:
+                    spans = None
             if spans is None and "xattrs" in blob and sel.import_only(patch, bit):
                 r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 diff = v.import_diff(patch, imstate, 60)
@@ -105,10 +113,14 @@ def main():
                 r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 same = None
                 expected = set(sel.body_expected)
-                idiff = v.import_diff(patch, imstate, 60) if at_import else []
+                idiff = v.import_diff(patch, imstate, 60) if (at_import or mixed) else []
                 if idiff is not None:
                     idiff = [k for k in idiff if k not in expected]
-                if not at_import or idiff == []:
+                if mixed:
+                    ok = idiff is not None and read_in_execution(blob, idiff) is None
+                else:
+                    ok = not at_import or idiff == []
+                if ok:
                     # the selector's limits (selector.plan_check_commits), with a long timeout
                     # so that a loaded machine does not hide a wrong answer behind "unknown"
                     saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000
@@ -130,7 +142,7 @@ def main():
                 what = "dropped" if same else ("kept, unknown" if same is None else "kept, differs")
                 what_at = getattr(v, "plan_at", None)
                 planned = "all" if only is None else bin(only).count("1")
-                print(f"   {cid}: probe {c:.1f}s cpu, {planned} planned, first difference {what_at}, "
+                print(f"   {cid}: {'mixed ' if mixed else ''}probe {c:.1f}s cpu, {planned} planned, first difference {what_at}, "
                       f"ran {getattr(v, 'plan_ran', None)}", flush=True)
             stats[what] += 1
             if what == "dropped" and fails:

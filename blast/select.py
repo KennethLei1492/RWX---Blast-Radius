@@ -618,13 +618,16 @@ class Selector:
             any_file = True
         return any_file
 
-    def body_lines(self, patch_text, bit=None):
+    def body_lines(self, patch_text, bit=None, allow_import=False):
         """For a patch that only edits statements inside functions of sqlglot modules, or the
         values of their parameter defaults: {path: [(first, last) line of each edited outermost
         function]}. None for any other patch. Sets self.body_at_import when one of those
         functions also runs while modules are imported.
         With `bit` (a test's index), files whose own selection does not hold that test are
-        left out: by the ordinary rules they cannot affect it."""
+        left out: by the ordinary rules they cannot affect it.
+        With `allow_import`, class-body and module-level statements may be edited too (their
+        effect is then what an import diff reports): self.body_import says whether any was."""
+        self.body_import = False
         self.body_at_import = False
         self.body_spans = None
         self.body_expected = set()   # import-state keys that differ by design: functions whose defaults changed
@@ -679,6 +682,9 @@ class Selector:
                         return None
                     out.setdefault(path, set()).add((node[1], node[2]))
                     bodies.setdefault(path, set()).add((node[3] + 1, node[2]))
+                    continue
+                if imp[0] in ("class", "const") and allow_import:
+                    self.body_import = True
                     continue
                 if imp[0] != "lines":
                     return None

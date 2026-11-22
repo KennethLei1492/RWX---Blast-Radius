@@ -174,7 +174,12 @@ set-up loads the tables and while plans execute and results are compared
 (`tools/build_tpcds.py xattr`, using `tools/attr_trace.py`'s rewriting), and every name loaded
 on the lines those phases run. When no changed key is among them (a class attribute neither
 recorded nor named there, a module global never named there), the execution part reads none
-of the change, and the same planning probe decides the test.
+of the change, and the same planning probe decides the test. A commit that edits function
+bodies and class-body or module-level statements together gets both checks: the import diff
+(less the functions whose defaults it changes) must hold no key the execution part reads,
+the edited functions must pass the execution checks below, and every query is planned.
+Checked on 28 oracle-labeled mixed commits (`tools/mutate_mixed.py`): the test was dropped in
+12, all of which pass it, and kept in all 12 that fail it.
 
 **Edits that run while queries execute (`maps/tpcds.bin` "xlines", `selector.queries_executing`).**
 An edited function that runs in the execution part used to keep the test outright. The map
