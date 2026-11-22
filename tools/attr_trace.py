@@ -21,6 +21,17 @@ reads, which every test inherits) and forks one child per test, collection inclu
 
 A change to an existing class-body assignment can only alter a test that reads that
 (class, NAME): until the first such read, the run is identical.
+
+Settings the tokenizer forwards. `Tokenizer._init_core` copies some thirty class settings
+(`nested_comments=self.NESTED_COMMENTS`, `numbers_can_be_underscore_separated=
+self.dialect.NUMBERS_CAN_BE_UNDERSCORE_SEPARATED`, ...) into a TokenizerCore whose __init__
+only stores each one (`self.nested_comments = nested_comments`). Every tokenizer built reads
+them all, yet a setting can only matter where the core reads its field (comments, numbers,
+heredocs, escapes). So those loads in `_init_core` are not recorded; instead each core
+remembers, per field, which (class, NAME) its value came from (resolved for the tokenizer's
+own class, or its dialect's), and a load of that field records that pair. A core whose origin
+is unknown records the NAME for every class. The forwarding is read from the pinned source
+(`forwarded_settings`) and applies only to fields stored nowhere else.
 """
 
 import ast
@@ -37,6 +48,61 @@ READS: set = set()          # (owner key, name) in the current phase
 LOADED: list = []         # files loaded through the rewriting loader
 _owner_cache: dict = {}
 _key_cache: dict = {}
+FWD: dict = {}              # core field -> ("self" | "dialect", NAME) forwarded by _init_core
+PROV: dict = {}             # id(core) -> (core, {field: (owner key, NAME)})
+CORE: list = []             # [TokenizerCore] once imported
+
+
+def forwarded_settings(root):
+    """{core field: (via, NAME)} for the keyword arguments of the TokenizerCore(...) call in
+    tokens.Tokenizer._init_core of the form self.NAME, self.dialect.NAME or bool(self.NAME),
+    whose field TokenizerCore stores only in __init__, straight from its parameter."""
+    tok = ast.parse(open(os.path.join(root, "sqlglot", "tokens.py"), encoding="utf-8").read())
+    core = ast.parse(open(os.path.join(root, "sqlglot", "tokenizer_core.py"), encoding="utf-8").read())
+    out = {}
+    for cls in tok.body:
+        if not (isinstance(cls, ast.ClassDef) and cls.name == "Tokenizer"):
+            continue
+        for fn in cls.body:
+            if not (isinstance(fn, ast.FunctionDef) and fn.name == "_init_core"):
+                continue
+            rets = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+            if len(rets) != 1 or not isinstance(rets[0].value, ast.Call):
+                return {}
+            call = rets[0].value
+            if not (isinstance(call.func, ast.Name) and call.func.id == "TokenizerCore") or call.args:
+                return {}
+            for kw in call.keywords:
+                v = kw.value
+                if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "bool" \
+                        and len(v.args) == 1 and not v.keywords:
+                    v = v.args[0]
+                if not isinstance(v, ast.Attribute):
+                    continue
+                if isinstance(v.value, ast.Name) and v.value.id == "self":
+                    out[kw.arg] = ("self", v.attr)
+                elif isinstance(v.value, ast.Attribute) and v.value.attr == "dialect" and \
+                        isinstance(v.value.value, ast.Name) and v.value.value.id == "self":
+                    out[kw.arg] = ("dialect", v.attr)
+    # the field must be stored exactly once, in TokenizerCore.__init__, from its parameter
+    for cls in core.body:
+        if not (isinstance(cls, ast.ClassDef) and cls.name == "TokenizerCore"):
+            continue
+        stores = {}
+        for fn in ast.walk(cls):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for n in ast.walk(fn):
+                targets = n.targets if isinstance(n, ast.Assign) else (
+                    [n.target] if isinstance(n, (ast.AnnAssign, ast.AugAssign)) else [])
+                for t in targets:
+                    for a in ast.walk(t):
+                        if isinstance(a, ast.Attribute) and isinstance(a.ctx, ast.Store):
+                            plain = (fn.name == "__init__" and isinstance(n, ast.Assign) and len(n.targets) == 1
+                                     and isinstance(n.value, ast.Name) and n.value.id == a.attr)
+                            stores.setdefault(a.attr, []).append(plain)
+        return {f: v for f, v in out.items() if stores.get(f) == [True]}
+    return {}
 
 
 def class_body_names(root):
@@ -123,6 +189,46 @@ def _record(obj, name):
 def _attr(obj, name):
     _record(obj, name)
     return getattr(obj, name)
+
+
+def _fwd_attr(obj, field):
+    """A load of a forwarded core field (or of an attribute with that name on anything)."""
+    if CORE and type(obj) is CORE[0]:
+        e = PROV.get(id(obj))
+        if e is not None and e[0] is obj:
+            p = e[1].get(field)
+            if p is not None:
+                READS.add(p)
+        else:
+            READS.add(("*", FWD[field][1]))   # a core of unknown origin
+    elif field in NAMES:
+        _record(obj, field)
+    return getattr(obj, field)
+
+
+def install_forwarding():
+    """Wrap Tokenizer._init_core: remember where each forwarded value of the new core came
+    from (the first class in the MRO of the tokenizer's class, or its dialect's, whose body
+    assigns NAME)."""
+    from sqlglot import tokenizer_core, tokens
+
+    CORE.append(tokenizer_core.TokenizerCore)
+    orig = tokens.Tokenizer._init_core
+
+    def _init_core(self):
+        core = orig(self)
+        prov = {}
+        for field, (via, name) in FWD.items():
+            try:
+                src = self if via == "self" else self.dialect
+                o = _owner(type(src), name, False)
+            except Exception:
+                o = ""
+            prov[field] = (o or "*", name)
+        PROV[id(core)] = (core, prov)
+        return core
+
+    tokens.Tokenizer._init_core = _init_core
 
 
 def _getattr(obj, name, *default):
@@ -213,6 +319,7 @@ def _vars(*args):
 
 
 builtins.__blast_attr__ = _attr
+builtins.__blast_fwd_attr__ = _fwd_attr
 builtins.__blast_getattr__ = _getattr
 builtins.__blast_hasattr__ = _hasattr
 builtins.__blast_dict__ = _dict
@@ -220,6 +327,19 @@ builtins.__blast_vars__ = _vars
 
 
 class _Rewrite(ast.NodeTransformer):
+    def __init__(self, path=""):
+        self.path = path
+        self.in_init_core = False
+
+    def visit_FunctionDef(self, node):
+        was = self.in_init_core
+        self.in_init_core = node.name == "_init_core" and self.path == "sqlglot/tokens.py"
+        try:
+            self.generic_visit(node)
+        finally:
+            self.in_init_core = was
+        return node
+
     def visit_Attribute(self, node):
         self.generic_visit(node)
         if not isinstance(node.ctx, ast.Load):
@@ -227,6 +347,12 @@ class _Rewrite(ast.NodeTransformer):
         if node.attr == "__dict__":
             return ast.copy_location(
                 ast.Call(func=ast.Name(id="__blast_dict__", ctx=ast.Load()), args=[node.value], keywords=[]), node)
+        if self.in_init_core and FWD and node.attr in {name for _, name in FWD.values()}:
+            return node   # forwarded into the core: recorded where the core reads the field
+        if node.attr in FWD:
+            return ast.copy_location(
+                ast.Call(func=ast.Name(id="__blast_fwd_attr__", ctx=ast.Load()),
+                         args=[node.value, ast.Constant(node.attr)], keywords=[]), node)
         if node.attr in NAMES:
             return ast.copy_location(
                 ast.Call(func=ast.Name(id="__blast_attr__", ctx=ast.Load()),
@@ -254,7 +380,7 @@ class _Loader(importlib.machinery.SourceFileLoader):
     def source_to_code(self, data, path, *, _optimize=-1):
         src = data.decode("utf-8") if isinstance(data, bytes) else data
         LOADED.append(path[len(ROOT):])
-        tree = _Rewrite().visit(ast.parse(src, path))
+        tree = _Rewrite(path[len(ROOT):]).visit(ast.parse(src, path))
         ast.fix_missing_locations(tree)
         return compile(tree, path, "exec", dont_inherit=True, optimize=_optimize)
 
@@ -282,6 +408,9 @@ def main():
     os.chdir(ROOT)
     os.makedirs(out_dir, exist_ok=True)
     NAMES.update(class_body_names(ROOT))
+    if os.environ.get("ATTR_NO_FWD") is None:
+        FWD.update(forwarded_settings(ROOT))
+    print(f"{len(FWD)} settings forwarded into TokenizerCore", flush=True)
     sys.meta_path.insert(0, _Finder())
 
     import pkgutil
@@ -291,6 +420,8 @@ def main():
     import sqlglot
     import tools.trace_plugin as tp  # for the inline process pool only
 
+    if FWD:
+        install_forwarding()
     tp._inline_process_pools()
     for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
         if info.name != "sqlglot.__main__":
