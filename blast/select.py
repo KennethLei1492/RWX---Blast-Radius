@@ -317,6 +317,22 @@ class Selector:
         cache = self.__dict__.setdefault("_absent", {})
         if name in cache:
             return cache[name]
+        # maps/idents.bin holds every identifier token in the pinned sqlglot/ and tests/ source
+        # (built from the pinned tree). An O(1) set lookup replaces a per-name grep subprocess.
+        idents = self.__dict__.get("_idents", False)
+        if idents is False:
+            idents = None
+            try:
+                import marshal
+                with open(os.path.join(self.dir, "idents.bin"), "rb") as fh:
+                    idents = marshal.loads(zlib.decompress(fh.read()))
+            except OSError:
+                idents = None
+            self._idents = idents
+        if idents is not None:
+            cache[name] = name not in idents
+            return cache[name]
+        # fall back to grep when the map is absent
         root = self.root
         if not root or not os.path.isdir(root):
             cache[name] = False
