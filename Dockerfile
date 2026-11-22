@@ -24,5 +24,5 @@ COPY blast /app/blast
 COPY maps /app/maps
 RUN python -m compileall -q /app/selector.py /app/blast && chmod -R a+rX /app /opt/sqlglot
 
-ENV SKIP_INTEGRATION=0 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 BLAST_PLAN_RUN_FRAC=0.9 BLAST_PLAN_COLLECT=30
+ENV SKIP_INTEGRATION=0 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "-I", "/app/selector.py"]
