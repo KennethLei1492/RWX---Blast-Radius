@@ -385,7 +385,7 @@ ISD_MIN_MS = 2300   # only commits whose ordinary selection costs at least this 
 ISD_TABLE_MIN_MS = 2000   # a class or module table edit: its entries usually have few readers
 # An import diff costs about this much CPU (scorer, ms); a selection the verify stage will run
 # for less anyway gets its exact failing tests there, so the import diff is skipped for it.
-ISD_CPU_MS = 600
+ISD_CPU_MS = 1200
 
 
 def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
