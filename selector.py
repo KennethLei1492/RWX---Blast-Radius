@@ -34,23 +34,6 @@ def pack(numbers, ms):
             i = loads.index(min(loads))
             ws[i].append(t)
             loads[i] += ms[t]
-        # local balance: move a test off the busiest worker to a lighter one while that
-        # strictly lowers the busiest load. Never changes which tests run, so it cannot miss
-        # and cannot raise the cost; it only ever tightens the busiest-worker time.
-        for _ in range(len(tests)):
-            bi = max(range(k), key=lambda i: loads[i])
-            moved = False
-            for t in sorted(ws[bi], key=lambda t: ms[t]):
-                for j in range(k):
-                    if j != bi and loads[j] + ms[t] < loads[bi]:
-                        ws[bi].remove(t); loads[bi] -= ms[t]
-                        ws[j].append(t); loads[j] += ms[t]
-                        moved = True
-                        break
-                if moved:
-                    break
-            if not moved:
-                break
         cost = max(loads) + 2000 * k
         if best is None or cost < best[0]:
             best = (cost, ws)
