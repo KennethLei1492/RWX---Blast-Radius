@@ -94,11 +94,19 @@ def plan_check_commits(sel, tests, ms, patches, static):
                     blob = marshal.loads(zlib.decompress(fh.read()))
             except OSError:
                 return {}
+        bit = sel.m["ids"].index(planfp.TEST_ID)
         try:
-            spans = sel.body_lines(patches[cid], sel.m["ids"].index(planfp.TEST_ID))
+            spans = sel.body_lines(patches[cid], bit)
         except Exception:
             spans = None
         if spans is None:
+            # Only class-body or module-level statements changed: their whole effect is the
+            # import-state difference, checked key by key against what the execution part reads.
+            try:
+                if "xattrs" in blob and sel.import_only(patches[cid], bit):
+                    todo.append((saving, cid, ("keys", frozenset()), None))
+            except Exception:
+                pass
             continue
         lines = blob["lines"]
         if any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
@@ -119,6 +127,26 @@ def plan_check_commits(sel, tests, ms, patches, static):
         return _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num, static)
     finally:
         spend("plan", start)
+
+
+def read_in_execution(blob, keys):
+    """The first import-state key that the TPC-DS test's class set-up or execution part may
+    read (maps/tpcds.bin: the class attributes recorded there, and every name loaded on the
+    lines they run), or None. A key that cannot be judged counts as read."""
+    xa, xn = blob.get("xattrs"), blob.get("xnames")
+    if xa is None or xn is None:
+        return keys[0] if keys else None
+    for k in keys:
+        if k.startswith("+") or k == "<modules>" or k.endswith(".<bases>"):
+            return k
+        mod, _, rest = k.partition(":")
+        if "." in rest:
+            cls, _, attr = rest.rpartition(".")
+            if f"{mod}:{cls}\x1f{attr}" in xa or f"*\x1f{attr}" in xa or attr in xn:
+                return k
+        elif rest in xn:
+            return k
+    return None
 
 
 def queries_reaching(blob, bodies):
@@ -155,7 +183,22 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
             continue
         c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         at_import, expected = at_import
-        if at_import:
+        if at_import == "keys":
+            # class-body or module-level edits: the import diff lists everything they change;
+            # none of it may be read while tables load or plans execute
+            if imstate is None:
+                try:
+                    with open(os.path.join(HERE, "maps", "imstate.bin"), "rb") as fh:
+                        imstate = marshal.loads(zlib.decompress(fh.read()))
+                except OSError:
+                    imstate = False
+            diff = v.import_diff(patches[cid], imstate, timeout=20) if imstate else None
+            hit = "unknown" if diff is None else read_in_execution(blob, diff)
+            if hit is not None:
+                print(f"{cid}: planning check not possible, the execution part may read {hit}; kept",
+                      file=sys.stderr)
+                continue
+        elif at_import:
             # an edited function also runs while modules are imported: the import must
             # leave exactly the pinned state (blast/imstate.py) for the argument to hold,
             # apart from the functions whose parameter defaults the patch changes (the probe

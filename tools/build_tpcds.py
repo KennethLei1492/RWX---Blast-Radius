@@ -369,6 +369,114 @@ def run_qexec(out):
     print("queries", len(res), "lines per query: max", max(sum(len(x) for x in r.values()) for r in res))
 
 
+def run_xattr(out):
+    """The (class, attribute) pairs the test reads while its class set-up loads the tables and
+    while plans are executed and results compared (outside parsing and the DuckDB
+    transpilation): tools/attr_trace.py's rewriting, recording only in those phases. Also the
+    names loaded on the lines those phases run ("names", from maps' trace lines)."""
+    from tools import attr_trace as at
+
+    os.environ.update(OMP_NUM_THREADS="1", SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
+    sys.dont_write_bytecode = True
+    sys.path[:0] = [ROOT.rstrip("/")]
+    os.chdir(ROOT)
+    at.NAMES.update(at.class_body_names(at.ROOT))
+    at.FWD.update(at.forwarded_settings(at.ROOT))
+
+    class PhaseSet(set):
+        on = False
+
+        def add(self, x):
+            if PhaseSet.on:
+                set.add(self, x)
+
+    reads = PhaseSet()
+    at.READS = reads
+    sys.meta_path.insert(0, at._Finder())
+    import sqlglot  # noqa: F401
+
+    from blast import verify
+
+    at.install_forwarding()
+    verify._inline_process_pools()
+    import tests.test_executor as te
+    from sqlglot.executor import python as py
+
+    def on():
+        PhaseSet.on = True
+
+    def off():
+        PhaseSet.on = False
+
+    real_execute = py.PythonExecutor.execute
+    real_parse = te.parse_one
+    real_transpile = te.transpile
+    real_helper = te.TestExecutor.subtestHelper
+
+    def execute(self, plan, outer_scope=None):
+        on()
+        return real_execute(self, plan, outer_scope)
+
+    def parse_one(*a, **k):
+        off()
+        return real_parse(*a, **k)
+
+    def transpile(*a, **k):
+        off()
+        try:
+            return real_transpile(*a, **k)
+        finally:
+            on()
+
+    def helper(self, *a, **k):
+        on()
+        return real_helper(self, *a, **k)
+
+    cls = te.TestExecutor
+    on()
+    try:
+        cls.setUpClass()
+    finally:
+        off()
+    py.PythonExecutor.execute = execute
+    te.parse_one = parse_one
+    te.transpile = transpile
+    cls.subtestHelper = helper
+    tc = cls("test_execute_tpcds")
+    try:
+        tc._mp_execute(te.TPCDS_SCHEMA, cls.tpcds_tables, cls.tpcds_sqls, False)
+    finally:
+        off()
+    json.dump({"attrs": sorted(set(reads))}, open(out, "w"))
+    print("class attributes read while loading tables and executing:", len(reads))
+
+
+def _names_on_lines(lines):
+    """Every name loaded (as a variable, or as an attribute of anything) on the given lines of
+    the pinned tree: {file: lines} -> set of names."""
+    import ast
+
+    names = set()
+    for rel, ls in lines.items():
+        ls = set(ls)
+        try:
+            tree = ast.parse(open(os.path.join(ROOT, rel), encoding="utf-8").read())
+        except (OSError, SyntaxError, ValueError):
+            return None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name):
+                name = n.id
+            elif isinstance(n, ast.Attribute):
+                name = n.attr
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                name = n.value   # getattr(x, "NAME"), globals()["NAME"]
+            else:
+                continue
+            if any(l in ls for l in range(n.lineno, (n.end_lineno or n.lineno) + 1)):
+                names.add(name)
+    return names
+
+
 def _count_queries():
     with open(os.path.join(ROOT, "tests", "fixtures", "optimizer", "tpc-ds", "tpc-ds.sql"), encoding="utf-8") as fh:
         text = fh.read()
@@ -431,6 +539,15 @@ def merge(out, trace, fps):
         if len(qtext) != len(runs[0]["plans"]):
             sys.exit("query count of the fixture does not match the fingerprints")
         blob["base"] = dict(runs[0], qtext=qtext)
+    xattr = os.environ.get("XATTR")
+    if xattr:   # class attributes and names the set-up and execution part read (run_xattr)
+        x = json.load(open(xattr))
+        names = _names_on_lines(lines)
+        if names is None:
+            sys.exit("cannot read the traced files")
+        blob["xattrs"] = frozenset(f"{o}\x1f{n}" for o, n in x["attrs"])
+        blob["xnames"] = frozenset(names)
+        print("execution part:", len(blob["xattrs"]), "class attributes,", len(names), "names")
     with open(out, "wb") as fh:
         fh.write(zlib.compress(marshal.dumps(blob), 9))
     print("wrote", out, os.path.getsize(out), "bytes;", len(runs), "agreeing runs;",
@@ -451,5 +568,7 @@ if __name__ == "__main__":
         run_qseq(sys.argv[2])
     elif mode == "qexec":
         run_qexec(sys.argv[2])
+    elif mode == "xattr":
+        run_xattr(sys.argv[2])
     else:
         merge(sys.argv[2], sys.argv[3], sys.argv[4:])

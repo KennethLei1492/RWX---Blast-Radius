@@ -585,6 +585,39 @@ class Selector:
         finally:
             self._alt = False
 
+    def import_only(self, patch_text, bit):
+        """Does the patch, in every file whose own selection holds test `bit`, only change
+        statements that run while modules are imported (class bodies, module constants), all
+        in existing sqlglot modules? Their whole effect is then the import-state difference
+        an import diff reports."""
+        if "\r\n" in patch_text:
+            patch_text = patch_text.replace("\r\n", "\n")
+        any_file = False
+        for fp in diffparse.parse(patch_text):
+            was = self.uncertain
+            try:
+                fb, _ = self.select_file(fp)
+            finally:
+                self.uncertain = was
+            if not fb >> bit & 1:
+                continue
+            path = fp.old_path
+            if path is None or fp.new_path != path or fp.binary or fp.is_new or fp.is_deleted:
+                return False
+            if not (path.startswith("sqlglot/") and path.endswith(".py")):
+                return False
+            old_src = self.read(path)
+            if old_src is None:
+                return False
+            applied = diffparse.apply(old_src, fp)
+            if not applied.ok:
+                return False
+            imps = pyimpact.analyze(path, self.view(path), old_src, "\n".join(applied.new_lines), applied)
+            if any(imp[0] not in ("class", "const", "none") for imp in imps):
+                return False
+            any_file = True
+        return any_file
+
     def body_lines(self, patch_text, bit=None):
         """For a patch that only edits statements inside functions of sqlglot modules, or the
         values of their parameter defaults: {path: [(first, last) line of each edited outermost

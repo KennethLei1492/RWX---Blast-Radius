@@ -165,6 +165,17 @@ patch. Checked with `tools/check_tpcds.py` on 212 labeled commits that select th
 49, none of which fails it (6 of them by running 1 to 6 differing queries), and kept in all
 64 where it fails.
 
+**Class-body and module-level edits (`maps/tpcds.bin` "xattrs"/"xnames", `selector.read_in_execution`).**
+A change to a class attribute or a module constant (a parser table, a type set, a setting)
+whose readers include the test used to keep it outright. Such statements run only at
+import, so their whole effect is the import-state difference the import diff reports. The
+map records, from one traced run of the test, every (class, attribute) read while the class
+set-up loads the tables and while plans execute and results are compared
+(`tools/build_tpcds.py xattr`, using `tools/attr_trace.py`'s rewriting), and every name loaded
+on the lines those phases run. When no changed key is among them (a class attribute neither
+recorded nor named there, a module global never named there), the execution part reads none
+of the change, and the same planning probe decides the test.
+
 **Only the queries an edit reaches (`maps/tpcds.bin` "qlines", `selector.queries_reaching`).**
 Planning the queries is nearly all of the probe (sqlglot's optimizer about half, the
 fingerprints a fifth), yet an edited statement is often run by only some of them, and an edit
