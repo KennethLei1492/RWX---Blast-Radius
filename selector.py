@@ -195,6 +195,22 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
     return results
 
 
+def verified_cheaply(sel, tests, ms, to_num, patch, S):
+    """Will the verify stage run all of S, for less CPU than an import diff costs? Then the
+    import diff can only add CPU: running the tests gives the exact failing ones."""
+    from blast import policy
+
+    file_of = {t["number"]: t["file"] for t in tests}
+    spawn_bits = sel.m.get("spawners", 0)
+    spawners = {to_num[i] for i in range(len(to_num)) if spawn_bits >> i & 1 and to_num[i] is not None}
+    U = {t for t in S if t in spawners or file_of[t] in policy.UNVERIFIABLE_FILES}
+    if U or not S:
+        return False
+    go, est = policy.decide(patch, S, S, U, ms, lambda s: cost_ms(s, ms), file_of,
+                            policy.costs(os.path.join(HERE, "maps")))
+    return go and est < ISD_CPU_MS
+
+
 def verify_cheap_commits(sel, tests, ms, to_num, patches, static):
     """Run the candidate tests of commits where that is expected to cost less than printing
     them, and keep only the tests that really fail (blast/verify.py, blast/policy.py)."""
@@ -264,6 +280,9 @@ def _verify_loop(plans, budget, start, v, patches, id_of, results):
 
 ISD_MIN_MS = 3500   # only commits whose ordinary selection costs at least this much
 ISD_TABLE_MIN_MS = 2000   # a class or module table edit: its entries usually have few readers
+# An import diff costs about this much CPU (scorer, ms); a selection the verify stage will run
+# for less anyway gets its exact failing tests there, so the import diff is skipped for it.
+ISD_CPU_MS = 600
 
 
 def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
@@ -278,6 +297,7 @@ def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
 
     todo = [c for c in static if uncertain.get(c) and c in patches
             and cost_ms(static[c], ms) >= (ISD_TABLE_MIN_MS if uncertain[c] == "table" else ISD_MIN_MS)]
+    todo = [c for c in todo if not verified_cheaply(sel, tests, ms, to_num, patches[c], static[c])]
     if not todo:
         return {}
     try:
