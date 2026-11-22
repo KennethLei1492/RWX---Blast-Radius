@@ -237,6 +237,76 @@ class Selector:
             b |= ti.get(x, 0)
         return b
 
+    _ENUM_INTERNALS = frozenset({"_member_map_", "_member_names_", "_value2member_map_",
+                                 "_hashable_values_", "_unhashable_values_", "_value_repr_",
+                                 "_member_type_", "__members__", "_last_values_"})
+
+    def _pinned_member_span(self, mod, clspath, attr):
+        """The (first, last) pinned line of `attr` when it is a method, nested class, or
+        property/static/classmethod assignment defined directly in the pinned class `clspath`
+        of module `mod`; else None. Such a member's import-state fingerprint changes only
+        because the patch (directly or through a decorator) altered that code, and the tests
+        that run it are exactly the tests that cover its body. None on any read error."""
+        import ast
+
+        key = (mod, clspath, attr)
+        cache = self.__dict__.setdefault("_memspan", {})
+        if key in cache:
+            return cache[key]
+        src = self.read(mod.replace(".", "/") + ".py")
+        res = None
+        if src is not None:
+            try:
+                node = ast.parse(src)
+                for part in clspath.split("."):
+                    node = next((c for c in getattr(node, "body", [])
+                                 if isinstance(c, ast.ClassDef) and c.name == part), None)
+                    if node is None:
+                        break
+                if node is not None:
+                    for st in node.body:
+                        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and st.name == attr:
+                            res = (st.lineno, st.end_lineno or st.lineno)
+                            break
+                        if isinstance(st, ast.Assign) and isinstance(st.value, ast.Call) \
+                                and isinstance(st.value.func, ast.Name) \
+                                and st.value.func.id in ("property", "staticmethod", "classmethod") \
+                                and any(isinstance(t, ast.Name) and t.id == attr for t in st.targets):
+                            res = (st.lineno, st.end_lineno or st.lineno)
+                            break
+            except (SyntaxError, ValueError):
+                res = None
+        cache[key] = res
+        return res
+
+    def _enum_not_iterated(self, enumname):
+        """True when no pinned test iterates the enum named `enumname` (so adding a member
+        cannot change a test's outcome through its internal member maps). Checked by searching
+        the pinned tests for `in <EnumName>` and `list(<EnumName>)`; any uncertainty -> False."""
+        short = enumname.rsplit(".", 1)[-1].rsplit(":", 1)[-1]
+        if not short or not short.isidentifier():
+            return False
+        cache = self.__dict__.setdefault("_enumiter", {})
+        if short in cache:
+            return cache[short]
+        root = self.root
+        if not root or not os.path.isdir(os.path.join(root, "tests")):
+            cache[short] = False
+            return False
+        import subprocess
+
+        hit = True
+        try:
+            r = subprocess.run(["grep", "-rqE", "--include=*.py",
+                                rf"(\bin +{short}\b|\b{short}\.__members__|list\( *{short} *\)|\[ *{short} *\])",
+                                os.path.join(root, "tests")],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            hit = (r.returncode == 0)
+        except Exception:  # noqa: BLE001
+            hit = True
+        cache[short] = not hit
+        return cache[short]
+
     def _name_absent_from_pinned(self, name):
         """True when identifier `name` occurs nowhere in the pinned sqlglot/ and tests/ source.
         Then no pinned code or test can reference it (by attribute access or by name for
@@ -258,7 +328,7 @@ class Selector:
             # whole-word search; return code 1 means "no match" i.e. absent
             r = subprocess.run(["grep", "-rwqF", "--include=*.py", name,
                                 os.path.join(root, "sqlglot"), os.path.join(root, "tests")],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
             found = (r.returncode == 0)
         except Exception:  # noqa: BLE001  -- cannot be sure: treat as present
             found = True
@@ -632,6 +702,18 @@ class Selector:
                 if "." in rest:
                     cls, _, attr = rest.rpartition(".")
                     if a is None or attr not in a["names"]:
+                        # not a traced data attribute.
+                        span = self._pinned_member_span(mod, cls, attr)
+                        if span is not None:
+                            # a method/nested class/property: its fingerprint changed because
+                            # the patch altered that code; select exactly the tests that run it
+                            b |= self.lines_users(mod.replace(".", "/") + ".py", range(span[0], span[1] + 1))
+                            continue
+                        if attr in self._ENUM_INTERNALS and self._enum_not_iterated(cls):
+                            # a member was added to an enum no test iterates: its internal
+                            # member maps changed, but the added member (a separate added key)
+                            # is the only observable effect and reaches tests through the code
+                            continue
                         return None
                     owner = f"{mod}:{cls}"
                     reads = a["reads"].get(owner, {})
