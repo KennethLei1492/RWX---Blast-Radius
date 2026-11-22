@@ -208,11 +208,20 @@ def _simple_token(s):
     return bool(s) and all(c.isalnum() or c in "_.-+'\"" for c in s)
 
 
-def default_users(path, old_lines, new_lines, applied, maps_dir):
+def default_users(path, old_lines, new_lines, applied, maps_dir, after_import=False):
     """If the change to `path` only replaces parameter defaults by another simple token, the
-    tests that relied on those defaults; otherwise None."""
+    tests that relied on those defaults; otherwise None. Defaults also used while importing
+    count only `after_import`: when an import diff has shown that the import leaves the pinned
+    state, so that only the uses after it can tell the defaults apart."""
     t = _load_dflt(maps_dir)
     sites_by_line = t.get("sites", {}).get(path) if t else None
+    if after_import and t:
+        extra = t.get("imp_sites", {}).get(path)
+        if extra:
+            merged = dict(sites_by_line or {})
+            for ln, v in extra.items():
+                merged[ln] = tuple(merged.get(ln, ())) + tuple(v)
+            sites_by_line = merged
     if not sites_by_line:
         return None
     removed = sorted(applied.removed)

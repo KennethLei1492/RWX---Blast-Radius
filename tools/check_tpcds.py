@@ -64,7 +64,11 @@ def main():
             else:
                 r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 same = None
-                if not at_import or v.import_diff(patch, imstate, 60) == []:
+                expected = set(sel.body_expected)
+                idiff = v.import_diff(patch, imstate, 60) if at_import else []
+                if idiff is not None:
+                    idiff = [k for k in idiff if k not in expected]
+                if not at_import or idiff == []:
                     # the selector's limits (selector.plan_check_commits), with a long timeout
                     # so that a loaded machine does not hide a wrong answer behind "unknown"
                     saving_s = (sel.cost(sel.pack(bits)) - sel.cost(sel.pack(bits & ~(1 << bit)))) / 1000

@@ -594,6 +594,7 @@ class Selector:
         left out: by the ordinary rules they cannot affect it."""
         self.body_at_import = False
         self.body_spans = None
+        self.body_expected = set()   # import-state keys that differ by design: functions whose defaults changed
         if "\r\n" in patch_text:
             patch_text = patch_text.replace("\r\n", "\n")
         out = {}
@@ -637,6 +638,8 @@ class Selector:
                         return None
                     if any(v.import_line(x) for x in range(node[3] + 1, node[2] + 1)):
                         self.body_at_import = True
+                    if len(imp) > 3 and imp[3]:
+                        self.body_expected.add(f"{pyimpact.module_name(path)}:{imp[3]}")
                     ns, ne = applied.new_range(node[1], node[2])
                     was = applied.old_lines if applied.old_lines is not None else old_src.split("\n")
                     if not equiv.only_defaults_differ(was[node[1] - 1:node[2]], applied.new_lines[ns - 1:ne]):
@@ -737,10 +740,30 @@ class Selector:
                 return b | got, "argflip"
         if self._dflt and new_src is not None and applied.removed \
                 and len(applied.removed) == len(applied.new_changed):
-            got = _cmpswap().default_users(path, old_src.split("\n"), applied.new_lines, applied, self.dir)
+            got = _cmpswap().default_users(path, old_src.split("\n"), applied.new_lines, applied, self.dir,
+                                           after_import=self._alt)
             if got is not None and not self._alt:
                 # only parameter defaults changed: the tests that relied on those defaults
                 return b | got, "default"
+            if got is not None:
+                # After an import diff: the import leaves the pinned state except for what it
+                # lists, so the changed defaults matter only to the calls that relied on them
+                # afterwards. The functions themselves differ (their defaults): expected keys.
+                # Subprocess tests import and run the patched code where nothing is traced.
+                quals = []
+                for imp in pyimpact.analyze(path, self.view(path), old_src, new_src, applied):
+                    if imp[0] == "none":
+                        continue
+                    if imp[0] != "defbody" or len(imp) < 4 or not imp[3] or imp[3] == "<display-lambda>":
+                        quals = None
+                        break
+                    quals.append(imp[3])
+                if quals:
+                    mod = pyimpact.module_name(path)
+                    self._expected.update(f"{mod}:{q}" for q in quals)
+                    if mod == "sqlglot" or "sqlglot" in self.m["rdeps"].get(mod, ()):
+                        got |= self.m.get("spawners", 0)
+                    return b | got, "default"
         if self._cmpt and new_src is not None and applied.removed \
                 and len(applied.removed) == len(applied.new_changed):
             got = _cmpswap().swap_users(path, old_src.split("\n"), applied.new_lines, applied, self.dir)

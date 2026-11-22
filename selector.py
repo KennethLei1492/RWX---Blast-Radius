@@ -103,7 +103,8 @@ def plan_check_commits(sel, tests, ms, patches, static):
         lines = blob["lines"]
         if any(any(a <= l <= b for l in lines.get(f, ())) for f, ss in spans.items() for a, b in ss):
             continue   # an edited function runs while plans are executed
-        todo.append((saving, cid, sel.body_at_import, queries_reaching(blob, sel.body_spans)))
+        todo.append((saving, cid, (sel.body_at_import, frozenset(sel.body_expected)),
+                     queries_reaching(blob, sel.body_spans)))
     if not todo:
         return {}
     v = Verifier()
@@ -153,9 +154,12 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
             print(f"{cid}: no time left for the planning check", file=sys.stderr)
             continue
         c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        at_import, expected = at_import
         if at_import:
             # an edited function also runs while modules are imported: the import must
-            # leave exactly the pinned state (blast/imstate.py) for the argument to hold
+            # leave exactly the pinned state (blast/imstate.py) for the argument to hold,
+            # apart from the functions whose parameter defaults the patch changes (the probe
+            # runs those patched functions anyway)
             if imstate is None:
                 try:
                     with open(os.path.join(HERE, "maps", "imstate.bin"), "rb") as fh:
@@ -163,6 +167,8 @@ def _plan_loop(todo, start, allowed, results, imstate, v, patches, blob, ms, num
                 except OSError:
                     imstate = False
             diff = v.import_diff(patches[cid], imstate, timeout=20) if imstate else None
+            if diff is not None:
+                diff = [k for k in diff if k not in expected]
             if diff != []:
                 print(f"{cid}: planning check not possible, the import "
                       f"{'is unknown' if diff is None else 'differs'}; kept", file=sys.stderr)

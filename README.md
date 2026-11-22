@@ -42,7 +42,7 @@ where each name is read (in function bodies, class bodies, module level and def 
 | `and` swapped with `or` | the tests in whose own run the swapped chain could have evaluated differently: it would need an operand the original skipped, skip a call the original made, or give a different result (`maps/cmpt.bin`, `tools/bool_trace.py`) |
 | an existing class-body assignment (a Dialect flag, a Parser or Generator setting) | exactly the tests that read that (class, attribute), recorded per test by rewriting attribute loads at import (`maps/attr.bin`, `tools/attr_trace.py`); the broader class rule above still applies if it is read while importing, copied by another class body, renamed or new. A Tokenizer setting (or one of the three Dialect settings it takes) reaches tokenizing only through the `TokenizerCore` that `Tokenizer._init_core` builds, which stores each value in a field and reads it at one place (comment, number, string, heredoc scanning): its readers are the tests that read that field of a core built for that class, not every test that built a tokenizer |
 | edits inside functions that leave each touched function's compiled code unchanged: reformatting, type hints (under `from __future__ import annotations`), renamed plain locals, comments, docstrings (`blast/equiv.py`) | none, unless a test read that file as text |
-| a parameter default replaced by another simple token (`copy: bool = True` -> `False`) | the tests that entered that function with the parameter holding its default (`maps/dflt.bin`, `tools/defaults_trace.py`); defaults used while importing keep the def-header rule above |
+| a parameter default replaced by another simple token (`copy: bool = True` -> `False`) | the tests that entered that function with the parameter holding its default (`maps/dflt.bin`, `tools/defaults_trace.py`); defaults used while importing keep the def-header rule above until the import diff below shows that the import leaves the pinned state apart from the function itself, and then also come down to the tests that relied on them after the import (plus the tests that import sqlglot in a subprocess) |
 | a `True`/`False` flipped inside an expression's `arg_types` | the tests that validated an instance of that class with that argument missing: the only reader of those values is validation (`maps/args.bin`, `tools/args_trace.py`) |
 
 Each of these per-test maps comes from running every test alone in a forked child with the
@@ -157,7 +157,8 @@ edited function start while the differing queries execute, the test is kept. A m
 early in planning ends the probe in about 0.3 s; the whole probe is limited to about the
 time dropping the test would save. If an edited function also runs while modules are
 imported, the import diff above must first show that the import leaves exactly the pinned
-state. Other files in the same patch (a fixture, a docstring, another test file) are left out
+state, apart from the functions whose parameter defaults the patch changes (the probe runs
+the patched functions in any case). Other files in the same patch (a fixture, a docstring, another test file) are left out
 of this when their own selection does not hold the test; the probe still runs on the whole
 patch. Checked with `tools/check_tpcds.py` on 212 labeled commits that select the test
 (code mutations, class and module table edits, TPC-DS query file edits): it was dropped in

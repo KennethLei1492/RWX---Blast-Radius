@@ -283,6 +283,92 @@ def run_qseq(out):
     print("queries", len(res))
 
 
+def run_qexec(out):
+    """Per query, the lines of the tree that run in its execution part (from the entry of
+    PythonExecutor.execute until its result has been compared with DuckDB's, outside the DuckDB
+    transpilation), all queries in order in one process with pools inline as when verifying;
+    plus, under "setup", the lines the class set-up runs."""
+    import pickle
+
+    from blast import verify
+
+    verify._install_overlay(ROOT, {})
+    verify._inline_process_pools()
+    import tests.test_executor as te
+    from sqlglot.executor import python as py
+
+    mon = sys.monitoring
+    tool = mon.COVERAGE_ID
+    mon.use_tool_id(tool, "tpcds-exec")
+    seen = set()
+    prefix = ROOT.rstrip("/") + "/"
+
+    def on_line(code, line):
+        f = code.co_filename
+        if f.startswith(prefix):
+            seen.add((f[len(prefix):], line))
+        return mon.DISABLE
+
+    mon.register_callback(tool, mon.events.LINE, on_line)
+
+    def on():
+        mon.set_events(tool, mon.events.LINE)
+
+    def off():
+        mon.set_events(tool, 0)
+
+    def grab():
+        files = {}
+        for f, ln in seen:
+            files.setdefault(f, []).append(ln)
+        seen.clear()
+        return {f: sorted(v) for f, v in files.items()}
+
+    cls = te.TestExecutor
+    on()
+    try:
+        cls.setUpClass()
+    finally:
+        off()
+    setup = grab()
+    te.initializer(te.TPCDS_SCHEMA, cls.tpcds_tables)
+    real_execute = py.PythonExecutor.execute
+    real_transpile = te.transpile
+
+    def execute(self, plan, outer_scope=None):
+        on()
+        try:
+            return real_execute(self, plan, outer_scope)
+        finally:
+            off()
+
+    def transpile(*a, **k):
+        off()
+        try:
+            return real_transpile(*a, **k)
+        finally:
+            on()
+
+    py.PythonExecutor.execute = execute
+    te.transpile = transpile
+    tc = cls("test_execute_tpcds")
+    res = []
+    for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
+        mon.restart_events()
+        expression = te.parse_one(sql)
+        fn, args = pickle.loads(pickle.dumps((te.mp_execute, (expression, meta))))
+        table = fn(*args)
+        if table is not None:
+            on()
+            try:
+                tc.subtestHelper(i, table, tpch=False)
+            finally:
+                off()
+        res.append(grab())
+    json.dump({"setup": setup, "queries": res}, open(out, "w"))
+    print("queries", len(res), "lines per query: max", max(sum(len(x) for x in r.values()) for r in res))
+
+
 def _count_queries():
     with open(os.path.join(ROOT, "tests", "fixtures", "optimizer", "tpc-ds", "tpc-ds.sql"), encoding="utf-8") as fh:
         text = fh.read()
@@ -363,5 +449,7 @@ if __name__ == "__main__":
         run_qcov(sys.argv[2])
     elif mode == "qseq":
         run_qseq(sys.argv[2])
+    elif mode == "qexec":
+        run_qexec(sys.argv[2])
     else:
         merge(sys.argv[2], sys.argv[3], sys.argv[4:])
