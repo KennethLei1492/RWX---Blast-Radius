@@ -208,6 +208,16 @@ class Verifier:
             return None
 
 
+
+def _source_bytes(text):
+    """The patched source as the bytes Python would read from disk. Compiling bytes makes the
+    interpreter honour an encoding declaration on the first two lines, as a real import does:
+    a `# coding: ascii` comment over non-ASCII text is a SyntaxError, not a no-op."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text
+
 def preload_core(root=SRC):
     """Import sqlglot and tests.helpers into this process from the pinned tree, as a child
     would first do (same path and working directory), so that children forked afterwards for
@@ -338,7 +348,7 @@ def _install_overlay(root, files):
             origin = module.__spec__.origin
             rel = os.path.relpath(origin, root).replace(os.sep, "/")
             module.__file__ = origin
-            code = compile(py[rel], origin, "exec", dont_inherit=True)
+            code = compile(_source_bytes(py[rel]), origin, "exec", dont_inherit=True)
             exec(code, module.__dict__)
 
     sys.meta_path.insert(0, Overlay())
@@ -435,7 +445,7 @@ def _child(root, files, test_ids):
             origin = module.__spec__.origin
             rel = os.path.relpath(origin, root).replace(os.sep, "/")
             module.__file__ = origin
-            code = compile(py[rel], origin, "exec", dont_inherit=True)
+            code = compile(_source_bytes(py[rel]), origin, "exec", dont_inherit=True)
             exec(code, module.__dict__)
 
     sys.meta_path.insert(0, Overlay())

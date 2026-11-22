@@ -341,6 +341,8 @@ def import_diff_commits(sel, tests, ms, to_num, patches, static, uncertain):
     todo = [c for c in static if uncertain.get(c) and c in patches
             and cost_ms(static[c], ms) >= (ISD_TABLE_MIN_MS if uncertain[c] == "table" else ISD_MIN_MS)]
     todo = [c for c in todo if not verified_cheaply(sel, tests, ms, to_num, patches[c], static[c])]
+    # the diff sees sqlglot's modules only: a patch that edits none of them gains nothing from it
+    todo = [c for c in todo if any(f.startswith("sqlglot/") and f.endswith(".py") for f in touched_files(patches[c]))]
     if not todo:
         return {}
     try:

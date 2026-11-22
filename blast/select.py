@@ -138,6 +138,32 @@ class BlobView:
         return self.info.get("chain", {}).get(l)
 
 
+_CODING_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+
+
+def _coding(first_two):
+    """The encoding a Python file declares (PEP 263), normalized; None for the default.
+    The declaration is a comment on line 1, or on line 2 when line 1 is blank or a comment."""
+    for line in first_two:
+        body = line.lstrip(" \t\f")
+        if body.startswith("#"):
+            at = body.find("coding")
+            while at >= 0:
+                rest = body[at + 6:]
+                if rest[:1] in (":", "="):
+                    rest = rest[1:].lstrip(" \t")
+                    n = 0
+                    while n < len(rest) and rest[n] in _CODING_CHARS:
+                        n += 1
+                    if n:
+                        name = rest[:n].lower().replace("_", "-")
+                        return None if name in ("utf-8", "utf8") else name
+                at = body.find("coding", at + 1)
+        elif body.strip("\r\n"):
+            break  # code on this line: a declaration below it does not count
+    return None
+
+
 class Selector:
     def __init__(self, maps_dir, source_root=None):
         self.dir = maps_dir
@@ -705,6 +731,36 @@ class Selector:
             return self.m["opens"].get(path, 0)
         return self.m["opens"].get(path, 0) | self.m["import_opens"].get(path, 0)
 
+    def shadowed_by(self, path):
+        """Tests a new Python file reaches by taking over a name that is already imported.
+        The checkout is first on the module search path (PYTHONPATH, and pytest's rootdir), so a
+        new top-level module or package named like a standard-library or installed module
+        replaces it in every process, and a new package directory beside `x.py` replaces
+        module `x`. None when the file shadows nothing."""
+        parts = path.split("/")
+        if parts[-1] == "__init__.py":
+            parts = parts[:-1]
+            if len(parts) > 1:
+                old = "/".join(parts) + ".py"
+                if os.path.isfile(os.path.join(self.root, old)) if self.root else False:
+                    return self.impact_users(("broken", pyimpact.module_name(old)), set())
+                return None
+        else:
+            parts[-1] = parts[-1][:-3]
+        if len(parts) != 1:
+            return None
+        name = parts[0]
+        if name in ("sitecustomize", "usercustomize") or name in sys.stdlib_module_names:
+            return self.all
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec(name) is not None:
+                return self.all
+        except (ImportError, ValueError, AttributeError):
+            return self.all
+        return None
+
     def select_file(self, fp):
         old_path, new_path = fp.old_path, fp.new_path
         b = 0
@@ -731,6 +787,10 @@ class Selector:
             return self.all, "config"
         if fp.binary:
             return b, "binary"
+        if fp.is_new and path.endswith(".py"):
+            hit = self.shadowed_by(path)
+            if hit is not None:
+                return hit, "shadow"
         if not path.endswith(".py"):
             if (path.startswith("tests/fixtures/") and old_path == new_path and not fp.is_new
                     and not fp.is_deleted and b):
@@ -745,6 +805,15 @@ class Selector:
                     if drop:
                         return b & ~drop, "data-setup"
             return b, "data"
+        if self._alt and not (path.startswith("sqlglot/") and path != "sqlglot/__main__.py"):
+            # The import diff imports sqlglot's modules and fingerprints what they leave behind.
+            # A test module or a script is not among them, so its module-level changes are not in
+            # that fingerprint: this file keeps its ordinary selection.
+            self._alt = False
+            try:
+                return self.select_file(fp)
+            finally:
+                self._alt = True
         old_src = self.read(old_path) if old_path else None
         if old_path and old_src is None:
             return b, "missing-old"
@@ -760,6 +829,13 @@ class Selector:
             if self._alt:
                 raise _NoAlt()
             return b | self.module_users(pyimpact.module_name(old_path)), "rename"
+        if new_src is not None and old_src is not None and _coding(old_src.split("\n", 2)[:2]) != _coding(
+                applied.new_lines[:2]):
+            # The file's encoding declaration changed: the interpreter decodes the whole file
+            # differently, or cannot decode it at all. Every string in it, or the import.
+            if self._alt:
+                raise _NoAlt()
+            return b | self.impact_users(("broken", pyimpact.module_name(path)), set()), "encoding"
         if new_src is not None and old_src is not None and equiv.equivalent(
                 self.view(path), old_src.split("\n"), applied.new_lines, applied):
             # every touched function compiles to the same code: formatting, hints, local names
