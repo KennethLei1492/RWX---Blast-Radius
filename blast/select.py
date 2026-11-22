@@ -766,7 +766,7 @@ class Selector:
             if not applied.ok:
                 return False
             imps = pyimpact.analyze(path, self.view(path), old_src, "\n".join(applied.new_lines), applied)
-            if any(imp[0] not in ("class", "const", "none") for imp in imps):
+            if any(imp[0] not in ("class", "const", "module", "none") for imp in imps):
                 return False
             any_file = True
         return any_file
@@ -836,7 +836,7 @@ class Selector:
                     out.setdefault(path, set()).add((node[1], node[2]))
                     bodies.setdefault(path, set()).add((node[3] + 1, node[2]))
                     continue
-                if imp[0] in ("class", "const") and allow_import:
+                if imp[0] in ("class", "const", "module") and allow_import:
                     self.body_import = True
                     continue
                 if imp[0] != "lines":
